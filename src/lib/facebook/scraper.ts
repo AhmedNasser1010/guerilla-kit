@@ -8,18 +8,24 @@ function normalizeCount(raw: string): string {
     .replace(/[٠-٩]/g, (d) => String("٠١٢٣٤٥٦٧٨٩".indexOf(d)))
     .replace(/٫/g, "."); // Arabic decimal separator
   return digits
-    .replace(/\s*ألف\s*/g, "K")
+    // ألف / الف / آلف / آلاف / ألاف (and the plural ألفات) all mean "thousand".
+    .replace(/\s*(?:أ|آ|ا)?ل(?:ا)?ف(?:ات)?\s*/g, "K")
     .replace(/\s*مليون\s*/g, "M")
     .replace(/\s+/g, " ")
     .trim();
 }
 
+// Privacy label as Facebook renders it on the hovercard, e.g.
+// "مجموعة عامة" (public group), "مجموعة خاصة" (private group) or English.
+const PRIVACY_RE = /مجموعة (?:عامة|خاصة)|\b(?:public|private) group\b/i;
+
 // Member-count pattern accepting Latin AND Arabic-Indic digits/separators,
-// e.g. "28.5K members", "٢٨٫٥ ألف عضو", "1.2 مليون عضو". The capture must
-// contain at least one digit so stray hidden fragments like ".member" or
-// "group…members" don't match.
+// e.g. "28.5K members", "٢٨٫٥ ألف عضو", "١٠ آلاف عضو", "1.2 مليون عضو".
+// The thousand word comes in several spellings (ألف، الف، آلف، آلاف، ألاف).
+// The capture must contain at least one digit so stray hidden fragments
+// like ".member" or "group…members" don't match.
 const MEMBER_RE =
-  /([٠-٩\d.,٫]*[٠-٩\d][٠-٩\d.,٫]*(?:\s*[KkMmأ])?(?:\s*(?:ألف|مليون))?)\s*(?:members?|أعضاء|عضو)/i;
+  /([٠-٩\d.,٫]*[٠-٩\d][٠-٩\d.,٫]*(?:\s*[KkMmأ])?(?:\s*(?:(?:أ|آ|ا)?ل(?:ا)?ف(?:ات)?|مليون))?)\s*(?:members?|أعضاء|عضو)/i;
 
 async function dismissDialogs(page: any): Promise<void> {
   const selectors = [
@@ -100,7 +106,7 @@ export async function scrapeGroups(
           const FEED_LINK =
             /multi_permalinks|comment_id|reply_comment_id|\/posts\/|\/permalink\/|\/share\/|story_fbid|notif_id|notif_t/;
           const MEMBERSHIP_MARKER =
-            /آخر زيارة|آخر نشاط|\bmembers?\b|أعضاء|عضو|last (?:visit|activity)/i;
+            /آخر زيارة|آخر نشاط|\bmembers?\b|أعضاء|عضو|last (?:visit|activity|active)/i;
 
           const results: {
             id: string;
@@ -166,7 +172,13 @@ export async function scrapeGroups(
               const sortIdx = t.indexOf("فرز");
               if (sortIdx !== -1 && sortIdx < 80) t = t.slice(sortIdx + 3);
               t = t.replace(/^عرض الكل/, "");
-              t = t.split(/آخر زيارة|آخر نشاط|أعضاء|عضو|last (?:visit|activity)/i)[0];
+              // English cards leave "View group" / trailing "You" fragments
+              // (e.g. "<name>You last visited a day ago View group"), so cut
+              // at those markers too.
+              t = t.split(
+                /آخر زيارة|آخر نشاط|أعضاء|عضو|عرض المجموعة|view group|last (?:visit|activity|active)/i
+              )[0];
+              t = t.replace(/\s*(?:you|أنت)\s*$/i, "");
               name = t.trim();
             }
             // Feed notifications never look like real group names.
@@ -233,37 +245,83 @@ export async function scrapeGroups(
       // Merge whatever cards are currently mounted (virtualized DOM).
       for (const entry of await collectRound()) {
         if (options.signal?.aborted) throw new Error("Aborted");
-        if (!MEMBER_RE.test(entry.joinedText)) {
+        // Privacy is never printed on the card itself and member counts only
+        // sometimes are, so we need the hovercard popup ("مجموعة عامة · N عضو")
+        // for every card that is still missing either marker. `knownText`
+        // reuses what we already captured in a previous round so already
+        // enriched groups don't get hovered again while scrolling.
+        const knownText =
+          entriesMap.get(entry.id)?.joinedText || entry.joinedText;
+        if (!(MEMBER_RE.test(knownText) && PRIVACY_RE.test(knownText))) {
           if (options.signal?.aborted) throw new Error("Aborted");
           report("hovering", entriesMap.size);
           try {
-            const loc = page.locator(`a[href*="/groups/${entry.id}"]`).first();
-            await loc.hover({ timeout: 800 });
-            await page.waitForTimeout(250);
-            const tip = await page
-              .evaluate(() => {
-                const sels = ['[role="tooltip"]', '[data-hovercard-target]', 'div[id^="hovercard"]'];
-                const parts: string[] = [];
-                for (const s of sels) {
-                  for (const el of document.querySelectorAll(s)) {
-                    const t = (el.textContent || "").trim();
-                    if (t) parts.push(t);
-                  }
+            // A card offers several anchors for the same group; the first one
+            // is often hidden (cover photo clone) and .hover() would waste its
+            // whole timeout without moving the pointer. Try every anchor
+            // (bounded) and skip the ones with no visible bounding box.
+            const anchors = await page
+              .locator(`a[href*="/groups/${entry.id}"]`)
+              .all()
+              .catch(() => [] as any[]);
+
+            // The popup ("Public group · N members" / "مجموعة عامة · N عضو")
+            // lazy-loads after a short delay, so poll instead of reading once.
+            // Ground truth from a DOM probe: its content lives in plain
+            // <span>s and its root is NOT role=tooltip/dialog/hovercard, so we
+            // scan any element and keep the minimal containers whose text
+            // actually carries group info — never the whole <body>.
+            let tip = "";
+            for (const a of anchors.slice(0, 4)) {
+              if (tip) break;
+              const box = await a.boundingBox().catch(() => null);
+              if (!box || box.width < 8 || box.height < 8) continue; // hidden
+              try {
+                await a.scrollIntoViewIfNeeded({ timeout: 1000 }).catch(() => {});
+                for (let tries = 0; tries < 10 && !tip; tries++) {
+                  if (tries === 0) await a.hover({ timeout: 1500 });
+                  else await page.waitForTimeout(300);
+                  tip = await page
+                    .evaluate(() => {
+                      const norm = (t: string | null) =>
+                        (t || "")
+                          .replace(/[\u200e\u200f]/g, "")
+                          .replace(/\s+/g, " ")
+                          .trim();
+                      const win =
+                        /مجموعة (?:عامة|خاصة)|public group|private group|members|أعضاء|عضو/i;
+                      const out: string[] = [];
+                      for (const el of document.querySelectorAll(
+                        "div,span,section,article,aside,li"
+                      )) {
+                        const t = norm(el.textContent);
+                        if (!t || !win.test(t)) continue;
+                        let childHas = false;
+                        for (const c of el.children) {
+                          if (win.test(norm(c.textContent))) {
+                            childHas = true;
+                            break;
+                          }
+                        }
+                        if (childHas) continue;
+                        out.push(t);
+                        if (out.length >= 3) break;
+                      }
+                      return out.join(" | ");
+                    })
+                    .catch(() => "");
                 }
-                return parts.join(" ").replace(/[\u200e\u200f]/g, "");
-              })
-              .catch(() => "");
-            let finalTip = tip;
-            if (!finalTip) {
-              finalTip = await page
-                .evaluate(() =>
-                  (document.body?.textContent || "").replace(/[\\u200e\\u200f]/g, "")
-                )
-                .catch(() => "");
+              } catch {
+                // Try the next anchor.
+              }
             }
-            if (finalTip) entry.joinedText += " " + finalTip;
+            if (tip) entry.joinedText += " " + tip;
           } catch {
             // ignore
+          } finally {
+            // Dismiss the popup so it can't block the next hover.
+            await page.keyboard.press("Escape").catch(() => {});
+            await page.waitForTimeout(150);
           }
         }
 
