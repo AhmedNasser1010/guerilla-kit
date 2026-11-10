@@ -27,14 +27,6 @@ export async function POST(request: Request) {
   });
 
   try {
-    const loggedIn = await isLoggedIn();
-    if (!loggedIn) {
-      return Response.json(
-        { error: "Not logged in to Facebook. Please log in first." },
-        { status: 401 }
-      );
-    }
-
     let backup = false;
     let detail = false;
     let erase = false;
@@ -62,6 +54,8 @@ export async function POST(request: Request) {
       // No or invalid JSON body
     }
 
+    // Handle erase BEFORE any login check: erasing must never launch the
+    // browser window (only the scrape/refresh path needs Facebook).
     if (erase) {
       if (confirm !== "ERASE") {
         return Response.json(
@@ -84,6 +78,14 @@ export async function POST(request: Request) {
         }
       }
       return Response.json({ ...EMPTY_CACHE });
+    }
+
+    const loggedIn = await isLoggedIn();
+    if (!loggedIn) {
+      return Response.json(
+        { error: "Not logged in to Facebook. Please log in first." },
+        { status: 401 }
+      );
     }
 
     resetProgress();
