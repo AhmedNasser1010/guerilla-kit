@@ -53,7 +53,7 @@ export async function backupCache(): Promise<string | null> {
     now.getDate()
   )}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
   const backupFile = path.join(DATA_DIR, `groups.backup-${stamp}.json`);
-  await fs.rename(CACHE_FILE, backupFile);
+  await fs.copyFile(CACHE_FILE, backupFile);
   return backupFile;
 }
 

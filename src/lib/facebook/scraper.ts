@@ -21,9 +21,55 @@ function normalizeCount(raw: string): string {
 const MEMBER_RE =
   /([٠-٩\d.,٫]*[٠-٩\d][٠-٩\d.,٫]*(?:\s*[KkMmأ])?(?:\s*(?:ألف|مليون))?)\s*(?:members?|أعضاء|عضو)/i;
 
+async function dismissDialogs(page: any): Promise<void> {
+  const selectors = [
+    'div[role="dialog"] button[aria-label="Close"]',
+    'div[role="dialog"] [aria-label="Close"]',
+    'div[role="dialog"] button:has-text("Got it")',
+    'div[role="dialog"] button:has-text("OK")',
+    'div[role="dialog"] button:has-text("Join")',
+  ];
+  for (const sel of selectors) {
+    try {
+      const btn = page.locator(sel).first();
+      if (await btn.isVisible({ timeout: 500 }).catch(() => false)) {
+        await btn.click({ timeout: 1000 }).catch(() => {});
+        await page.waitForTimeout(300);
+      }
+    } catch {
+      // ignore
+    }
+  }
+  try {
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(200);
+  } catch {
+    // ignore
+  }
+}
+
+export interface ScrapeOptions {
+  detail?: boolean;
+  maxGroups?: number;
+  signal?: AbortSignal;
+  onProgress?: (update: {
+    phase: string;
+    current?: number;
+    total?: number;
+    log?: string;
+  }) => void;
+}
+
 export async function scrapeGroups(
-  context: BrowserContext
+  context: BrowserContext,
+  options: ScrapeOptions = {}
 ): Promise<Group[]> {
+  const doDetail = options.detail === true;
+  const onProgress = options.onProgress;
+  const report = (phase: string, current?: number, total?: number, log?: string) => {
+    if (log) onProgress?.({ phase, current, total, log });
+    else onProgress?.({ phase, current, total });
+  };
   const page = await context.newPage();
   try {
     // "Display all" (عرض الكل) page listing every group the account has joined.
@@ -34,6 +80,7 @@ export async function scrapeGroups(
     });
 
     await page.waitForTimeout(3000);
+    await dismissDialogs(page);
 
     const url = page.url();
     if (url.includes("login") || url.includes("checkpoint")) {
@@ -169,7 +216,10 @@ export async function scrapeGroups(
     let lastTotal = -1;
     let stableRounds = 0;
     const MAX_SCROLL_ROUNDS = 60;
+    const maxGroups = options.maxGroups;
     for (let i = 0; i < MAX_SCROLL_ROUNDS && stableRounds < 3; i++) {
+      if (options.signal?.aborted) throw new Error("Aborted");
+      if (maxGroups && entriesMap.size >= maxGroups) break;
       await page.evaluate(() =>
         window.scrollTo(0, document.documentElement.scrollHeight)
       );
@@ -182,6 +232,41 @@ export async function scrapeGroups(
 
       // Merge whatever cards are currently mounted (virtualized DOM).
       for (const entry of await collectRound()) {
+        if (options.signal?.aborted) throw new Error("Aborted");
+        if (!MEMBER_RE.test(entry.joinedText)) {
+          if (options.signal?.aborted) throw new Error("Aborted");
+          report("hovering", entriesMap.size);
+          try {
+            const loc = page.locator(`a[href*="/groups/${entry.id}"]`).first();
+            await loc.hover({ timeout: 800 });
+            await page.waitForTimeout(250);
+            const tip = await page
+              .evaluate(() => {
+                const sels = ['[role="tooltip"]', '[data-hovercard-target]', 'div[id^="hovercard"]'];
+                const parts: string[] = [];
+                for (const s of sels) {
+                  for (const el of document.querySelectorAll(s)) {
+                    const t = (el.textContent || "").trim();
+                    if (t) parts.push(t);
+                  }
+                }
+                return parts.join(" ").replace(/[\u200e\u200f]/g, "");
+              })
+              .catch(() => "");
+            let finalTip = tip;
+            if (!finalTip) {
+              finalTip = await page
+                .evaluate(() =>
+                  (document.body?.textContent || "").replace(/[\\u200e\\u200f]/g, "")
+                )
+                .catch(() => "");
+            }
+            if (finalTip) entry.joinedText += " " + finalTip;
+          } catch {
+            // ignore
+          }
+        }
+
         const existing = entriesMap.get(entry.id);
         if (!existing) {
           entriesMap.set(entry.id, entry);
@@ -207,7 +292,18 @@ export async function scrapeGroups(
         await page.waitForTimeout(1000);
       }
 
+      if (maxGroups && entriesMap.size > maxGroups) {
+        const keep = [...entriesMap.keys()].slice(0, maxGroups);
+        const trimmed = new Map();
+        for (const k of keep) trimmed.set(k, entriesMap.get(k));
+        entriesMap.clear();
+        for (const [k, v] of trimmed) entriesMap.set(k, v);
+      }
       const total = entriesMap.size;
+      report("collecting", total, undefined, `Collected ${total} groups so far`);
+      if (maxGroups && entriesMap.size >= maxGroups) {
+        stableRounds = 3;
+      }
       if (total === lastTotal) {
         stableRounds++;
       } else {
@@ -242,40 +338,51 @@ export async function scrapeGroups(
       });
     }
 
-    for (let i = 0; i < groups.length; i++) {
-      const group = groups[i];
+    if (doDetail) {
+    const CONCURRENCY = Math.max(
+      1,
+      Number(process.env.DETAIL_CONCURRENCY || 5)
+    );
+
+    // Process detail fetches with bounded concurrency. Each worker reuses
+    // its own page to avoid creating one page per group.
+    const workers: Promise<void>[] = [];
+    const queue = [...groups];
+    const results: (Group | null)[] = new Array(groups.length).fill(null);
+    const indexById = new Map(groups.map((g, idx) => [g.id, idx]));
+
+    async function processOne(group: Group): Promise<Group | null> {
+      if (options.signal?.aborted) return null;
+      const p = await context.newPage();
+      await p.route("**/*", (route) => {
+        const type = route.request().resourceType();
+        if (type === "font" || type === "media") route.abort();
+        else route.continue();
+      }).catch(() => {});
       try {
-        const response = await page.goto(group.url, {
+        const response = await p.goto(group.url, {
           waitUntil: "domcontentloaded",
           timeout: 15000,
         });
-        if (response && response.status() === 404) {
-          groups.splice(i, 1);
-          i--;
-          continue;
-        }
+        if (response && response.status() === 404) return null;
 
-        await page.waitForTimeout(1500);
+        await p.waitForTimeout(1500);
+        await dismissDialogs(p);
 
-        // Groups whose name couldn't be recovered from the list card get it
-        // from the group page title: "<Group name> | Facebook".
         if (!group.name) {
-          const title = await page.title().catch(() => "");
+          const title = await p.title().catch(() => "");
           const cleaned = title
-            .replace(/[\u200e\u200f]/g, "")
-            .replace(/\s*\|\s*Facebook\s*$/i, "")
+            .replace(/[\\u200e\\u200f]/g, "")
+            .replace(/\\s*\\|\\s*Facebook\\s*$/i, "")
             .trim();
           if (cleaned && cleaned.length >= 2 && cleaned.length <= 140) {
             group.name = cleaned;
           }
         }
 
-        // FB renders member counts and privacy as plain text, often visually
-        // hidden (so innerText omits them) and laced with RTL/LTR marks
-        // (\u200e/\u200f) between words — use textContent and strip the marks.
-        const bodyText = await page
+        const bodyText = await p
           .evaluate(() =>
-            (document.body?.textContent || "").replace(/[\u200e\u200f]/g, "")
+            (document.body?.textContent || "").replace(/[\\u200e\\u200f]/g, "")
           )
           .catch(() => "");
 
@@ -292,7 +399,7 @@ export async function scrapeGroups(
         }
 
         if (!group.logoUrl) {
-          const logo = await page
+          const logo = await p
             .locator(
               '[aria-label*="group profile" i] image, [aria-label*="group photo" i] image, [role="img"] image'
             )
@@ -303,7 +410,7 @@ export async function scrapeGroups(
           if (logo && logo.startsWith("http")) {
             group.logoUrl = logo;
           } else {
-            const logoImg = await page
+            const logoImg = await p
               .locator('img[src*="facebook.com"], img[src*="fbcdn.net"]')
               .nth(1)
               .getAttribute("src", { timeout: 1500 })
@@ -311,11 +418,45 @@ export async function scrapeGroups(
             if (logoImg) group.logoUrl = logoImg;
           }
         }
+        return group;
       } catch {
-        // Skip groups that failed to load.
+        return group;
+      } finally {
+        await p.close().catch(() => {});
       }
     }
 
+    // Run workers
+    const workerCount = Math.min(CONCURRENCY, groups.length || 1);
+    let cursor = 0;
+    async function worker() {
+      while (cursor < queue.length) {
+        const idx = cursor++;
+        const g = queue[idx];
+        const res = await processOne(g);
+        report("enriching", idx + 1, queue.length, `Enriched ${g.name || g.id}`);
+        const origIdx = indexById.get(g.id);
+        if (origIdx !== undefined) results[origIdx] = res;
+      }
+    }
+    for (let w = 0; w < workerCount; w++) workers.push(worker());
+    await Promise.all(workers);
+
+    // Rebuild groups array dropping 404s
+    const filtered: Group[] = [];
+    for (const r of results) {
+      if (r) filtered.push(r);
+    }
+    groups.length = 0;
+    groups.push(...filtered);
+
+    // skip original sequential block below by returning early via flag
+    // (fall through to final filter)
+    // We handle final filtering after this block.
+    // Mark by setting a flag variable
+    var detailDone = true; void detailDone;
+
+    }
     // Drop anything we couldn't identify (no name after both passes).
     const identified = groups.filter((g) => g.name);
     return identified;

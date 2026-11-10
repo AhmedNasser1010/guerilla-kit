@@ -102,6 +102,11 @@ export function Dashboard() {
   const [sortOrder, setSortOrder] = React.useState<GroupSortOrder>("default")
   const [filter, setFilter] = React.useState<GroupFilter>("all")
   const [confirmRefreshOpen, setConfirmRefreshOpen] = React.useState(false)
+  const [confirmEraseOpen, setConfirmEraseOpen] = React.useState(false)
+  const [erasing, setErasing] = React.useState(false)
+  const [progressOpen, setProgressOpen] = React.useState(false)
+  const [progress, setProgress] = React.useState<{ phase: string; current: number; total: number; logs: string[]; running: boolean } | null>(null)
+  const abortRef = React.useRef<AbortController | null>(null)
   const [confirmLogoutOpen, setConfirmLogoutOpen] = React.useState(false)
   const [loggingOut, setLoggingOut] = React.useState(false)
   const [postedIds, setPostedIds] = React.useState<Record<string, boolean>>({})
@@ -376,12 +381,23 @@ export function Dashboard() {
 
   async function refreshGroups(backup: boolean) {
     setRefreshing(true)
+    setProgressOpen(true)
+    setProgress(null)
+    const controller = new AbortController()
+    abortRef.current = controller
+    const poll = setInterval(async () => {
+      try {
+        const r = await fetch("/api/groups/progress")
+        if (r.ok) setProgress(await r.json())
+      } catch {}
+    }, 500)
     setConfirmRefreshOpen(false)
     try {
       const res = await fetch("/api/groups", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ backup }),
+        signal: controller.signal,
       })
       const data = await res.json()
 
@@ -397,10 +413,17 @@ export function Dashboard() {
       toast.success(
         `Loaded ${data.groups.length} groups${backup ? " (old cache backed up)" : ""}`
       )
-    } catch {
-      toast.error("Failed to refresh groups")
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") {
+        toast.info("Refresh aborted")
+      } else {
+        toast.error("Failed to refresh groups")
+      }
     } finally {
+      clearInterval(poll)
+      abortRef.current = null
       setRefreshing(false)
+      // Keep the dialog open so logs are not lost; user closes it manually.
     }
   }
 
@@ -779,6 +802,7 @@ export function Dashboard() {
         pageDetecting={pageDetecting}
         onRefresh={() => setConfirmRefreshOpen(true)}
         onAddGroup={() => setAddGroupOpen(true)}
+        onEraseAll={() => setConfirmEraseOpen(true)}
         searchQuery={searchQuery}
         onSearch={setSearchQuery}
       />
@@ -1227,6 +1251,75 @@ export function Dashboard() {
               Refresh with backup
             </Button>
           </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* confirm erase dialog */}
+      <Dialog open={confirmEraseOpen} onOpenChange={setConfirmEraseOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Erase all data?</DialogTitle>
+            <DialogDescription>
+              This deletes all cached groups, manual groups, pages, and logs you out
+              of Facebook. A backup file is created first. This cannot be undone
+              from the UI.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmEraseOpen(false)} disabled={erasing}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={erasing}
+              onClick={async () => {
+                setErasing(true)
+                try {
+                  const res = await fetch("/api/groups", { method: "DELETE" })
+                  if (!res.ok) throw new Error("Failed to erase")
+                  toast.success("All data erased")
+                  window.location.reload()
+                } catch (e) {
+                  toast.error(e instanceof Error ? e.message : "Failed to erase")
+                } finally {
+                  setErasing(false)
+                  setConfirmEraseOpen(false)
+                }
+              }}
+            >
+              {erasing ? "Erasing..." : "Erase all"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* progress dialog */}
+      <Dialog open={progressOpen} onOpenChange={setProgressOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Fetching groups…</DialogTitle>
+            <DialogDescription>
+              {progress ? `${progress.phase} — ${progress.current}/${progress.total || "?"}` : "Starting…"}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="h-2 w-full overflow-hidden rounded bg-muted">
+            <div
+              className="h-full bg-primary transition-all"
+              style={{
+                width: progress && progress.total ? `${Math.min(100, (progress.current / progress.total) * 100)}%` : "0%",
+              }}
+            />
+          </div>
+          <div className="max-h-48 overflow-auto rounded border bg-muted/30 p-2 text-xs font-mono">
+            {(progress?.logs || []).map((l, i) => (
+              <div key={i}>{l}</div>
+            ))}
+          </div>
+          <div className="flex justify-end">
+            <Button variant="destructive" size="sm" onClick={() => abortRef.current?.abort()}>
+              Abort
+            </Button>
+          </div>
         </DialogContent>
       </Dialog>
 

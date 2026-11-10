@@ -11,6 +11,7 @@ import {
   ChevronDown,
   Search,
   Plus,
+  Trash2,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -43,6 +44,7 @@ export function Header({
   pageDetecting,
   onRefresh,
   onAddGroup,
+  onEraseAll,
   searchQuery,
   onSearch,
 }: {
@@ -60,6 +62,7 @@ export function Header({
   pageDetecting: boolean
   onRefresh: () => void
   onAddGroup: () => void
+  onEraseAll: () => void
   searchQuery: string
   onSearch: (value: string) => void
 }) {
@@ -146,6 +149,15 @@ export function Header({
             onClick={onRefresh}
           >
             <RefreshCw className={refreshing ? "animate-spin" : ""} />
+          </Button>
+          <Button
+            size="icon"
+            variant="destructive"
+            title="Erase all data"
+            aria-label="Erase all data"
+            onClick={onEraseAll}
+          >
+            <Trash2 />
           </Button>
           <ThemeToggle />
         </div>
