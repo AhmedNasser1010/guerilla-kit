@@ -38,6 +38,7 @@ export async function POST(request: Request) {
     let backup = false;
     let detail = false;
     let erase = false;
+    let logout = true;
     let maxGroups: number | undefined;
     let confirm = "";
     try {
@@ -45,12 +46,15 @@ export async function POST(request: Request) {
         backup?: boolean;
         detail?: boolean;
         erase?: boolean;
+        logout?: boolean;
         confirm?: string;
         maxGroups?: number;
       } | null;
       backup = body?.backup === true;
       if (body?.detail === false) detail = false;
       erase = body?.erase === true;
+      // Log out of Facebook by default; send logout: false to keep the session.
+      logout = body?.logout !== false;
       confirm = body?.confirm ?? "";
       // TESTING: cap fetched groups (set TEST_MAX_GROUPS to change; remove to lift)
       maxGroups = Number(process.env.TEST_MAX_GROUPS || 10);
@@ -72,10 +76,12 @@ export async function POST(request: Request) {
         // ignore
       }
       await writeCache({ ...EMPTY_CACHE });
-      try {
-        await logoutFromFacebook();
-      } catch {
-        // ignore
+      if (logout) {
+        try {
+          await logoutFromFacebook();
+        } catch {
+          // ignore
+        }
       }
       return Response.json({ ...EMPTY_CACHE });
     }
@@ -125,11 +131,17 @@ export async function POST(request: Request) {
 }
 
 export async function DELETE(request: Request) {
-  // Convenience alias for erase.
+  // Convenience alias for erase. Logs out by default; pass logout: false to keep the session.
+  let body: Record<string, unknown> | null = null;
+  try {
+    body = (await request.json()) as Record<string, unknown>;
+  } catch {
+    // No or invalid JSON body
+  }
   return POST(
     new Request(request.url, {
       method: "POST",
-      body: JSON.stringify({ erase: true, confirm: "ERASE" }),
+      body: JSON.stringify({ erase: true, confirm: "ERASE", logout: true, ...body }),
       headers: { "content-type": "application/json" },
     })
   );

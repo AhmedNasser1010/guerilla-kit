@@ -505,6 +505,25 @@ export function Dashboard() {
     }
   }
 
+  async function eraseAll(doLogout: boolean) {
+    setErasing(true)
+    try {
+      const res = await fetch("/api/groups", {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ logout: doLogout }),
+      })
+      if (!res.ok) throw new Error("Failed to erase")
+      toast.success(doLogout ? "All data erased and logged out" : "All data erased")
+      window.location.reload()
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Failed to erase")
+    } finally {
+      setErasing(false)
+      setConfirmEraseOpen(false)
+    }
+  }
+
   async function openLogin() {
     setLoginPending(true)
     setLoginOpen(true)
@@ -1256,38 +1275,32 @@ export function Dashboard() {
 
       {/* confirm erase dialog */}
       <Dialog open={confirmEraseOpen} onOpenChange={setConfirmEraseOpen}>
-        <DialogContent>
+        <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>Erase all data?</DialogTitle>
             <DialogDescription>
-              This deletes all cached groups, manual groups, pages, and logs you out
-              of Facebook. A backup file is created first. This cannot be undone
-              from the UI.
+              This deletes all cached groups, manual groups, and pages. Do you
+              also want to log out of Facebook? A backup file is created first.
+              This cannot be undone from the UI.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setConfirmEraseOpen(false)} disabled={erasing}>
+            <Button variant="outline" onClick={() => setConfirmEraseOpen(false)} disabled={erasing} className="sm:mr-auto">
               Cancel
+            </Button>
+            <Button
+              variant="outline"
+              disabled={erasing}
+              onClick={() => eraseAll(false)}
+            >
+              {erasing ? "Erasing..." : "Erase data only"}
             </Button>
             <Button
               variant="destructive"
               disabled={erasing}
-              onClick={async () => {
-                setErasing(true)
-                try {
-                  const res = await fetch("/api/groups", { method: "DELETE" })
-                  if (!res.ok) throw new Error("Failed to erase")
-                  toast.success("All data erased")
-                  window.location.reload()
-                } catch (e) {
-                  toast.error(e instanceof Error ? e.message : "Failed to erase")
-                } finally {
-                  setErasing(false)
-                  setConfirmEraseOpen(false)
-                }
-              }}
+              onClick={() => eraseAll(true)}
             >
-              {erasing ? "Erasing..." : "Erase all"}
+              {erasing ? "Erasing..." : "Erase & log out"}
             </Button>
           </DialogFooter>
         </DialogContent>
