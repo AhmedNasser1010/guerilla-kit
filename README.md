@@ -1,4 +1,4 @@
-# FB Group Poster
+# GuerillaKit
 
 A Next.js web app that lets you post to multiple Facebook groups as your Page, using browser automation (Playwright) with your own logged-in Facebook session.
 

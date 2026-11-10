@@ -82,7 +82,7 @@ export default function LandingPage() {
               <Send className="size-4" />
             </span>
             <span className="text-base font-semibold tracking-tight">
-              FB Group Poster
+              GuerillaKit
             </span>
           </Link>
           <nav className="hidden items-center gap-1 text-sm text-muted-foreground sm:flex">
@@ -122,7 +122,7 @@ export default function LandingPage() {
               </span>
             </h1>
             <p className="mt-6 max-w-2xl text-lg text-pretty text-muted-foreground">
-              FB Group Poster lets you compose a single post and publish it to
+              GuerillaKit lets you compose a single post and publish it to
               every Facebook group you manage — with images, tracking, and a
               workflow that takes minutes, not hours.
             </p>
@@ -276,7 +276,7 @@ export default function LandingPage() {
               <span className="flex size-6 items-center justify-center rounded-md bg-primary text-primary-foreground">
                 <Send className="size-3" />
               </span>
-              <span className="font-medium text-foreground">FB Group Poster</span>
+              <span className="font-medium text-foreground">GuerillaKit</span>
             </div>
             <p className="text-xs">Runs locally on your machine. Your data stays yours.</p>
           </div>

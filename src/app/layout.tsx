@@ -15,7 +15,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "FB Group Poster",
+  title: "GuerillaKit",
   description: "Automate posting to your Facebook groups",
 };
 

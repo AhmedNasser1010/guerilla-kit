@@ -199,7 +199,7 @@ export async function buildGroupsWorkbook(
   const columns = resolveColumns(columnKeys);
 
   const workbook = new ExcelJS.Workbook();
-  workbook.creator = "FB Group Poster";
+  workbook.creator = "GuerillaKit";
   workbook.created = new Date();
 
   const sheet = workbook.addWorksheet("Groups", {
@@ -216,7 +216,7 @@ export async function buildGroupsWorkbook(
   titleRow.height = 26;
   sheet.mergeCells(1, 1, 1, lastCol);
   const titleCell = titleRow.getCell(1);
-  titleCell.value = `FB Group Poster — Groups export (${new Date().toLocaleString()})`;
+  titleCell.value = `GuerillaKit — Groups export (${new Date().toLocaleString()})`;
   titleCell.font = { bold: true, size: 13, color: { argb: COLORS.headerFg } };
   titleCell.alignment = { vertical: "middle", horizontal: "left" };
   for (let c = 1; c <= lastCol; c++) {
