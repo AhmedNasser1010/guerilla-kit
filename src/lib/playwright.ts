@@ -2,7 +2,10 @@ import { chromium, type BrowserContext, type Page } from "playwright";
 import path from "path";
 import { writeSession } from "./session";
 
-const BROWSER_DATA_DIR = path.join(process.cwd(), "browser-data");
+// The turbopackIgnore comment opts this call out of Turbopack's build-time
+// path analysis: browser-data/ is a generated Playwright profile, not
+// something the build should trace/bundle.
+const BROWSER_DATA_DIR = path.join(/* turbopackIgnore: true */ process.cwd(), "browser-data");
 
 let contextInstance: BrowserContext | null = null;
 let loginPage: Page | null = null;
