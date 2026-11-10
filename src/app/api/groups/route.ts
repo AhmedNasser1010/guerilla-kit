@@ -52,7 +52,8 @@ export async function POST(request: Request) {
       if (body?.detail === false) detail = false;
       erase = body?.erase === true;
       confirm = body?.confirm ?? "";
-      if (typeof body?.maxGroups === "number") maxGroups = body.maxGroups;
+      // TESTING: cap fetched groups (set TEST_MAX_GROUPS to change; remove to lift)
+      maxGroups = Number(process.env.TEST_MAX_GROUPS || 10);
     } catch {
       // No or invalid JSON body
     }
