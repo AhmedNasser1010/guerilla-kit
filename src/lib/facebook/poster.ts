@@ -117,6 +117,254 @@ async function findComposerTrigger(
   return { trigger: null, reloaded };
 }
 
+// ---------------------------------------------------------------------------
+// Mentions
+//
+// A blue @mention in the composer is NOT text: it is an entity token FB only
+// creates when an entry is picked from the autocomplete popup (opened by
+// typing "@"). Pasting or typing "@Name" without picking a suggestion stays
+// plain text forever. The popup renders as role="option" entries scoped to
+// the composer dialog.
+//
+// The name after "@" is typed word by word; after every word we read the
+// popup and click a suggestion matching what was typed so far. Matching:
+//   - an option whose first line equals the typed name → strong match
+//   - exactly one option whose first line contains the typed name → match
+//     (only once the query is ≥ 4 chars so a short prefix can't misfire)
+// If no popup / no match ever appears, the "@…" text simply stays plain
+// text — exactly the pre-mention behavior — and the name is reported back
+// in the result message.
+// ---------------------------------------------------------------------------
+
+/** The suggestions list debounces after keystrokes; wait before reading it. */
+const MENTION_POPUP_WAIT_MS = Number.parseInt(
+  process.env.FB_MENTION_POPUP_WAIT_MS || "350",
+  10
+);
+// A mention query longer than this will never match — bail out.
+const MENTION_MAX_QUERY_LEN = 64;
+
+const normalizeText = (s: string) => s.replace(/\s+/g, " ").trim();
+
+interface MentionTypingResult {
+  /** Mentions successfully inserted via the autocomplete popup. */
+  inserted: number;
+  /** Names left as plain text (no matching suggestion was found). */
+  failed: string[];
+}
+
+interface TextSegment {
+  kind: "text" | "mention";
+  value: string;
+}
+
+/**
+ * Splits raw post text into plain-text and @mention segments. A mention
+ * candidate starts at "@" and runs to the end of the line or the next "@";
+ * an "@" with nothing usable after it is plain text. Unmatched candidates
+ * harm the post not at all: their characters were already typed out and so
+ * remain plain text.
+ */
+function parseMentionSegments(text: string): TextSegment[] {
+  const segments: TextSegment[] = [];
+  const re = /@([^\n@]*)/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) {
+      segments.push({ kind: "text", value: text.slice(last, m.index) });
+    }
+    if (m[1].trim()) {
+      segments.push({ kind: "mention", value: m[1] });
+    } else {
+      segments.push({ kind: "text", value: m[0] });
+    }
+    last = re.lastIndex;
+  }
+  if (last < text.length) {
+    segments.push({ kind: "text", value: text.slice(last) });
+  }
+  return segments;
+}
+
+/** Visible role="option" entries of the mention popup, in display order. */
+async function visibleMentionOptions(
+  scope: Locator | Page
+): Promise<Locator[]> {
+  const all = scope.locator('[role="option"]');
+  const count = await all.count().catch(() => 0);
+  if (count === 0) return [];
+  const visible: Locator[] = [];
+  for (let i = 0; i < Math.min(count, 12); i++) {
+    const opt = all.nth(i);
+    if (await opt.isVisible().catch(() => false)) visible.push(opt);
+  }
+  return visible;
+}
+
+/**
+ * Picks the suggestion matching the typed query: -1 when nothing matches
+ * confidently yet. The option's first line is the entity name; the remaining
+ * lines are subtitles ("Page", "Friend", "صديق", …).
+ */
+function pickMentionOption(optionTexts: string[], query: string): number {
+  const nq = normalizeText(query);
+  if (nq.length < 2) return -1;
+  const firstLines = optionTexts.map((t) => normalizeText(t.split("\n")[0] || t));
+  const exact = firstLines.findIndex((line) => line === nq);
+  if (exact !== -1) return exact;
+  const hits: number[] = [];
+  firstLines.forEach((line, i) => {
+    if (line.includes(nq)) hits.push(i);
+  });
+  if (hits.length === 1 && nq.length >= 4) return hits[0];
+  return -1;
+}
+
+/** Types the not-yet-typed tail of a mention name as plain text. */
+async function typeMentionRemainder(
+  textbox: Locator,
+  parts: string[],
+  from: number,
+  typeDelayMs: number
+): Promise<void> {
+  const rest = parts.slice(from).join("");
+  if (rest) await textbox.pressSequentially(rest, { delay: typeDelayMs });
+}
+
+/**
+ * Types one mention candidate (everything after its "@"), word by word,
+ * clicking the autocomplete suggestion as soon as it matches confidently.
+ * Returns true when a mention was inserted; false when the text stayed
+ * plain (any untyped tail is typed out first so nothing is lost).
+ */
+async function typeMention(
+  page: Page,
+  scope: Locator | Page,
+  textbox: Locator,
+  name: string,
+  typeDelayMs: number
+): Promise<boolean> {
+  const parts = name.split(/(\s+)/).filter((p) => p.length > 0);
+  let query = "";
+  let lastQ = "";
+
+  for (let i = 0; i < parts.length; i++) {
+    await textbox.pressSequentially(parts[i], { delay: typeDelayMs });
+    query += parts[i];
+    const q = normalizeText(query);
+    if (!q || q === lastQ) continue; // whitespace-only progress: nothing new to match
+    lastQ = q;
+
+    await page.waitForTimeout(MENTION_POPUP_WAIT_MS);
+    const options = await visibleMentionOptions(scope);
+    if (options.length === 0) {
+      // No suggestions at all: mentions are unavailable here, or the query
+      // filtered the list to nothing. Keep the text as-is (plain).
+      if (q.length >= 3) {
+        await typeMentionRemainder(textbox, parts, i + 1, typeDelayMs);
+        return false;
+      }
+      continue;
+    }
+    const texts = await Promise.all(
+      options.map((opt) => opt.innerText().catch(() => ""))
+    );
+    const idx = pickMentionOption(texts, q);
+    if (idx !== -1) {
+      await options[idx].click();
+      // Let the editor swap the typed "@query" for the mention token.
+      await page.waitForTimeout(300);
+      return true;
+    }
+    if (q.length > MENTION_MAX_QUERY_LEN) {
+      await typeMentionRemainder(textbox, parts, i + 1, typeDelayMs);
+      return false;
+    }
+  }
+  // Fully typed without a confident match — plain text (nothing left to type).
+  return false;
+}
+
+/** Ctrl+V one plain-text segment into the composer from the clipboard. */
+async function pasteSegment(page: Page, segment: string): Promise<boolean> {
+  const wrote = await page.evaluate(async (t) => {
+    try {
+      await navigator.clipboard.writeText(t);
+      return true;
+    } catch {
+      return false;
+    }
+  }, segment);
+  if (!wrote) return false;
+  await page.keyboard.press(
+    process.platform === "darwin" ? "Meta+v" : "Control+v"
+  );
+  await page.waitForTimeout(300);
+  return true;
+}
+
+/**
+ * Types the whole post into the composer, turning "@Name" tokens into real
+ * mentions via FB's autocomplete popup. Plain segments go on the clipboard
+ * and are Ctrl+V'd in (fast, and pasted newlines insert as line breaks — no
+ * Enter keypress is ever sent, which could submit); anything a paste didn't
+ * deliver falls back to human-style typing (Shift+Enter for line breaks — a
+ * plain Enter submits comment boxes).
+ */
+async function typeComposerText(
+  page: Page,
+  scope: Locator | Page,
+  textbox: Locator,
+  text: string,
+  clipboardOk: boolean
+): Promise<MentionTypingResult> {
+  const result: MentionTypingResult = { inserted: 0, failed: [] };
+  const typeDelayMs = Math.max(
+    0,
+    Number.parseInt(process.env.FB_TYPE_DELAY_MS || "80", 10) || 80
+  );
+
+  for (const segment of parseMentionSegments(text)) {
+    if (segment.kind === "text") {
+      if (!segment.value) continue;
+      let pasted = false;
+      if (clipboardOk) pasted = await pasteSegment(page, segment.value);
+      if (pasted) {
+        // Verify the editor actually received the segment.
+        const editorText = await textbox
+          .evaluate((el) => (el as HTMLElement).innerText)
+          .catch(() => "");
+        if (normalizeText(editorText).includes(normalizeText(segment.value))) {
+          continue;
+        }
+      }
+      const lines = segment.value.replace(/\r\n?/g, "\n").split("\n");
+      for (let i = 0; i < lines.length; i++) {
+        if (i > 0) await textbox.press("Shift+Enter");
+        if (lines[i]) {
+          await textbox.pressSequentially(lines[i], { delay: typeDelayMs });
+        }
+      }
+    } else {
+      await textbox.pressSequentially("@", { delay: typeDelayMs });
+      const ok = await typeMention(
+        page,
+        scope,
+        textbox,
+        segment.value,
+        typeDelayMs
+      );
+      if (ok) {
+        result.inserted++;
+      } else {
+        result.failed.push(normalizeText(segment.value).slice(0, 60));
+      }
+    }
+  }
+  return result;
+}
+
 export async function postToGroup(
   context: BrowserContext,
   groupUrl: string,
@@ -299,52 +547,34 @@ export async function postToGroup(
     await textbox.click();
     await textbox.fill("");
 
-    // Fast path: put the text on the clipboard and Ctrl+V it into the
-    // composer. Pasted newlines are inserted as line breaks in one input
-    // event — fast, and no Enter keypress is ever sent (which could submit).
-    // The clipboard API needs explicit permission in Chromium.
-    let pasted = false;
+    // Clipboard permission is granted once up front: plain-text segments are
+    // delivered by Ctrl+V (fast, and newlines insert as line breaks without
+    // any Enter keypress that could submit).
+    let clipboardOk = false;
     try {
       const origin = new URL(page.url()).origin;
       await context.grantPermissions(["clipboard-read", "clipboard-write"], {
         origin,
       });
-      pasted = await page.evaluate(async (t) => {
-        try {
-          await navigator.clipboard.writeText(t);
-          return true;
-        } catch {
-          return false;
-        }
-      }, text);
-      if (pasted) {
-        await page.keyboard.press(
-          process.platform === "darwin" ? "Meta+v" : "Control+v"
-        );
-        await page.waitForTimeout(300);
-      }
+      clipboardOk = true;
     } catch {
-      pasted = false;
+      clipboardOk = false;
     }
 
-    // Verify the editor actually received the text; otherwise fall back to
-    // human-style typing (Shift+Enter for line breaks — a plain Enter
-    // submits comment boxes).
-    const editorText = await textbox
-      .evaluate((el) => (el as HTMLElement).innerText)
-      .catch(() => "");
-    const normalize = (s: string) => s.replace(/\s+/g, " ").trim();
-    if (normalize(editorText) !== normalize(text)) {
-      const typeDelayMs = Math.max(
-        0,
-        Number.parseInt(process.env.FB_TYPE_DELAY_MS || "80", 10) || 80
-      );
-      const lines = text.replace(/\r\n?/g, "\n").split("\n");
-      for (let i = 0; i < lines.length; i++) {
-        if (i > 0) await textbox.press("Shift+Enter");
-        await textbox.pressSequentially(lines[i], { delay: typeDelayMs });
-      }
-    }
+    // Type the post segment by segment so "@Name" tokens can be turned into
+    // real mentions through FB's autocomplete popup. Pasting "@Name" only
+    // ever produces plain text — see the Mentions block below.
+    const mentionScope = dialogVisible ? dialog : page;
+    const mention = await typeComposerText(
+      page,
+      mentionScope,
+      textbox,
+      text,
+      clipboardOk
+    );
+    const mentionNote = mention.failed.length
+      ? ` Note: ${mention.failed.length} @mention(s) had no matching suggestion and were published as plain text: ${mention.failed.join(" | ")}`
+      : "";
 
     await page.waitForTimeout(1000);
 
@@ -433,7 +663,10 @@ export async function postToGroup(
       // Fast non-blocking check is intended here — we poll on an interval.
       const dialogStillVisible = await dialog.isVisible().catch(() => false);
       if (!dialogStillVisible) {
-        return { success: true, message: "Post published successfully" };
+        return {
+          success: true,
+          message: "Post published successfully" + mentionNote,
+        };
       }
 
       const statusText = await dialog
@@ -456,7 +689,9 @@ export async function postToGroup(
     await dumpHtml(page, "post-uncertain");
     return {
       success: true,
-      message: `Post submitted (still processing on Facebook${lastStatus ? `: ${lastStatus}` : ""}) — verify on Facebook`,
+      message: `Post submitted (still processing on Facebook${
+        lastStatus ? `: ${lastStatus}` : ""
+      }) — verify on Facebook${mentionNote}`,
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
