@@ -304,6 +304,7 @@ export async function scrapeGroups(
     const entriesMap = new Map<string, Entry>();
     let lastTotal = -1;
     let stableRounds = 0;
+    let capHit = false;
     const MAX_SCROLL_ROUNDS = 60;
     const maxGroups = options.maxGroups;
     for (let i = 0; i < MAX_SCROLL_ROUNDS && stableRounds < 3; i++) {
@@ -320,7 +321,21 @@ export async function scrapeGroups(
       await page.waitForTimeout(400);
 
       // Merge whatever cards are currently mounted (virtualized DOM).
-      for (const entry of await collectRound()) {
+      const roundEntries = await collectRound();
+      // Count how many cards still need the hovercard popup (member count or
+      // privacy marker missing) so the hover pass can report real progress
+      // ("3/12") instead of a meaningless running total.
+      let hoverTotal = 0;
+      for (const entry of roundEntries) {
+        const known = entriesMap.get(entry.id);
+        const knownText =
+          [known?.joinedText, known?.tip].filter(Boolean).join(" ") ||
+          entry.joinedText;
+        if (!(MEMBER_RE.test(knownText) && PRIVACY_RE.test(knownText)))
+          hoverTotal++;
+      }
+      let hoverDone = 0;
+      for (const entry of roundEntries) {
         if (options.signal?.aborted) throw new Error("Aborted");
         // Privacy is never printed on the card itself and member counts only
         // sometimes are, so we need the hovercard popup ("مجموعة عامة · N عضو")
@@ -334,7 +349,8 @@ export async function scrapeGroups(
         let tip = "";
         if (!(MEMBER_RE.test(knownText) && PRIVACY_RE.test(knownText))) {
           if (options.signal?.aborted) throw new Error("Aborted");
-          report("hovering", entriesMap.size);
+          hoverDone++;
+          report("hovering", hoverDone, hoverTotal);
           try {
             // A card offers several anchors for the same group; the first one
             // is often hidden (cover photo clone) and .hover() would waste its
@@ -440,19 +456,44 @@ export async function scrapeGroups(
         for (const [k, v] of trimmed) entriesMap.set(k, v);
       }
       const total = entriesMap.size;
-      report("collecting", total, undefined, `Collected ${total} groups so far`);
+      const gained = lastTotal < 0 ? total : total - lastTotal;
       if (maxGroups && entriesMap.size >= maxGroups) {
         stableRounds = 3;
-      }
-      if (total === lastTotal) {
+        capHit = true;
+      } else if (total === lastTotal) {
         stableRounds++;
       } else {
         stableRounds = 0;
         lastTotal = total;
       }
+      // Only log when something actually changed — a delta, or the stall
+      // counter moving. Identical "nothing happened" lines are pure noise.
+      if (gained !== 0 || stableRounds > 0) {
+        const stableNote =
+          stableRounds > 0 ? ` · no new groups ${stableRounds}/3` : "";
+        report(
+          "collecting",
+          total,
+          undefined,
+          `Round ${i + 1}/${MAX_SCROLL_ROUNDS}: +${gained} new · ${total} total${stableNote}`
+        );
+      }
     }
 
     const entries = [...entriesMap.values()];
+    // Say WHY collection stopped — otherwise a stall is indistinguishable
+    // from a normal end-of-list.
+    const exitReason = capHit
+      ? `cap reached (${maxGroups} groups)`
+      : stableRounds >= 3
+        ? "no new groups in 3 rounds"
+        : "max scroll rounds reached";
+    report(
+      "collecting",
+      entries.length,
+      undefined,
+      `Collection finished: ${exitReason} — ${entries.length} groups${doDetail ? "" : " (detail pass off)"}`
+    );
 
 
     const groups: Group[] = [];
@@ -502,6 +543,12 @@ export async function scrapeGroups(
     const CONCURRENCY = Math.max(
       1,
       Number(process.env.DETAIL_CONCURRENCY || 5)
+    );
+    report(
+      "enriching",
+      0,
+      groups.length,
+      `Detail pass: ${groups.length} groups, ${CONCURRENCY} workers`
     );
 
     // Process detail fetches with bounded concurrency. Each worker reuses
@@ -634,8 +681,15 @@ export async function scrapeGroups(
     for (const r of results) {
       if (r) filtered.push(r);
     }
+    const dropped = results.length - filtered.length;
     groups.length = 0;
     groups.push(...filtered);
+    report(
+      "enriching",
+      filtered.length,
+      filtered.length,
+      `Detail pass finished${dropped ? `: ${dropped} group${dropped === 1 ? "" : "s"} dropped` : ""}`
+    );
 
     // skip original sequential block below by returning early via flag
     // (fall through to final filter)

@@ -1312,7 +1312,13 @@ export function Dashboard() {
           <DialogHeader>
             <DialogTitle>Fetching groups…</DialogTitle>
             <DialogDescription>
-              {progress ? `${progress.phase} — ${progress.current}/${progress.total || "?"}` : "Starting…"}
+              {progress
+                ? progress.total
+                  ? `${progress.phase} — ${progress.current}/${progress.total}`
+                  : progress.phase === "collecting" || progress.phase === "hovering"
+                  ? `${progress.phase} — ${progress.current} groups`
+                  : `${progress.phase} — ${progress.current}`
+                : "Starting…"}
             </DialogDescription>
           </DialogHeader>
           <div className="h-2 w-full overflow-hidden rounded bg-muted">

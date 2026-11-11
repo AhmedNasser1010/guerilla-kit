@@ -3,7 +3,7 @@ export const runtime = "nodejs";
 import { readCache, updateCache, backupCache, writeCache } from "@/lib/cache";
 import { EMPTY_CACHE } from "@/lib/types";
 import { resetProgress, setProgress, addLog, finishProgress, getProgress } from "@/lib/progress";
-import { getBrowserContext, isLoggedIn, logoutFromFacebook } from "@/lib/playwright";
+import { getBrowserContext, isLoggedIn, logoutFromFacebook, closeBrowser } from "@/lib/playwright";
 import { scrapeGroups } from "@/lib/facebook/scraper";
 
 let refreshLock: Promise<unknown> | null = null;
@@ -91,6 +91,9 @@ export async function POST(request: Request) {
     resetProgress();
     setProgress("starting", 0, 0);
     addLog("Starting group refresh");
+    addLog(
+      `Options: detail=${detail ? "on" : "off"}, maxGroups=${maxGroups ?? "none"}, backup=${backup ? "on" : "off"}`
+    );
 
     const existingCache = await readCache();
     const manualGroups = existingCache.manualGroups;
@@ -121,11 +124,19 @@ export async function POST(request: Request) {
       lastUpdated: new Date().toISOString(),
     });
 
+    addLog(`Done: ${updated.groups.length} groups saved`);
+
     return Response.json(updated);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Failed to refresh groups";
+    addLog(`Refresh failed: ${message}`);
     return Response.json({ error: message }, { status: 500 });
   } finally {
+    // Close the persistent Chromium window regardless of outcome. The
+    // profile (cookies / login state) lives on disk, so the session
+    // survives; the next endpoint that needs the browser just relaunches it.
+    addLog("Closing browser window");
+    await closeBrowser().catch(() => {});
     finishProgress();
     refreshLock = null;
     resolveLock();
