@@ -79,6 +79,12 @@ import {
   DEFAULT_EXPORT_COLUMNS,
   type ExportColumnKey,
 } from "@/lib/export-columns"
+import {
+  loadDraftContent,
+  saveDraftContent,
+  loadDraftImage,
+  saveDraftImage,
+} from "@/lib/draft-storage"
 
 type GroupFilter = "all" | "posted" | "remaining"
 
@@ -141,6 +147,16 @@ export function Dashboard() {
   const [exportColumns, setExportColumns] = React.useState<ExportColumnKey[]>(
     DEFAULT_EXPORT_COLUMNS
   )
+
+  function updateContent(v: string) {
+    setContent(v)
+    saveDraftContent(v)
+  }
+
+  function updateImageFile(f: File | null) {
+    setImageFile(f)
+    void saveDraftImage(f)
+  }
 
   function setNote(groupId: string, note: string) {
     setGroupNotes((prev) => {
@@ -395,6 +411,12 @@ export function Dashboard() {
       } catch {
         // localStorage unavailable — keep defaults
       }
+
+      // restore the draft post text and attached image
+      setContent(loadDraftContent())
+      const savedImage = await loadDraftImage()
+      if (cancelled) return
+      if (savedImage) setImageFile(savedImage)
 
       setLoaded(true)
     }
@@ -1068,9 +1090,9 @@ export function Dashboard() {
 
             <Composer
               content={content}
-              setContent={setContent}
+              setContent={updateContent}
               imageFile={imageFile}
-              setImageFile={setImageFile}
+              setImageFile={updateImageFile}
               selectedGroup={selectedGroup}
               posting={posting}
               postStatus={
