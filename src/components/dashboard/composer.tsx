@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { FolderDown, ImageIcon, Send, Square, X } from "lucide-react"
+import { AlignLeft, AlignRight, FolderDown, ImageIcon, Send, Square, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { Badge } from "@/components/ui/badge"
@@ -61,6 +61,26 @@ export function Composer({
 }) {
   const fileInputRef = React.useRef<HTMLInputElement>(null)
   const [skipPosted, setSkipPosted] = React.useState(true)
+  const [dir, setDir] = React.useState<"ltr" | "rtl">(() => {
+    try {
+      return window.localStorage.getItem("draftDir") === "rtl" ? "rtl" : "ltr"
+    } catch {
+      // localStorage unavailable — default direction
+      return "ltr"
+    }
+  })
+
+  function toggleDir() {
+    setDir((prev) => {
+      const next = prev === "rtl" ? "ltr" : "rtl"
+      try {
+        window.localStorage.setItem("draftDir", next)
+      } catch {
+        // localStorage unavailable — direction just won't persist
+      }
+      return next
+    })
+  }
 
   const previewUrl = React.useMemo(
     () => (imageFile ? URL.createObjectURL(imageFile) : null),
@@ -125,6 +145,7 @@ export function Composer({
           placeholder="Write your post content here..."
           value={content}
           onChange={(e) => setContent(e.target.value)}
+          dir={dir}
           className="min-h-32 resize-y border-none bg-transparent p-0 text-base shadow-none focus-visible:ring-0"
           disabled={disabled}
         />
@@ -171,6 +192,16 @@ export function Composer({
             >
               <ImageIcon />
               {imageFile ? "Replace image" : "Add image"}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={toggleDir}
+              title="Toggle text direction between RTL and LTR"
+              aria-label={`Text direction: ${dir === "rtl" ? "right to left" : "left to right"} — click to switch`}
+            >
+              {dir === "rtl" ? <AlignRight /> : <AlignLeft />}
+              {dir === "rtl" ? "RTL" : "LTR"}
             </Button>
             <label
               className="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground"
