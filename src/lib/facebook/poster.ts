@@ -16,13 +16,33 @@ const COMMENT_LABEL_RE = /تعليق|comment/i;
 // Text of the composer trigger on the group page (Arabic + English layouts):
 // "اكتب شيئًا...", "أنشئ منشورًا عامًا", "What's on your mind...",
 // "Write something...", "Start a discussion", "Announce something", etc.
-// NOTE: no "u" flag — Playwright fails to serialize flagged regexes for
-// locator.filter({ hasText }) (Invalid flags supplied to RegExp constructor).
+// The /i flag is REQUIRED: some groups render the trigger in English with a
+// capital letter ("Write something...") which a case-sensitive pattern never
+// matches — that was the actual cause of "Could not find the post composer"
+// on such groups (e.g. groups/324050471991806) while Arabic-only triggers
+// (caseless by nature) kept every other group working.
+// NOTE: don't add the 'u' flag — Playwright fails to serialize 'u'-flagged
+// regexes for locator.filter({ hasText }) / getByRole name ("Invalid flags
+// supplied to RegExp constructor"). The 'i' flag serializes fine.
 const TRIGGER_TEXT_RE =
-  /what'?s on your mind|write something|create (?:a )?public post|start a discussion|announce something|اكتب شيئ|أنشئ منشور|انشئ منشور|اكتب منشور|إنشاء منشور|انشاء منشور|ابدأ مناقشة|ابدا مناقشة|أعلن شيئ|اعلن شيئ/;
+  /what'?s on your mind|write something|create (?:a )?public post|start a discussion|announce something|اكتب شيئ|أنشئ منشور|انشئ منشور|اكتب منشور|إنشاء منشور|انشاء منشور|ابدأ مناقشة|ابدا مناقشة|أعلن شيئ|اعلن شيئ/i;
 
 // Submit button of the composer dialog: "Post" (en) / "نشر" / "أنشر" (ar).
 const POST_BUTTON_RE = /^(?:post|نشر|أنشر|انشر)$/i;
+
+// The composer trigger is usually present right after navigation, but FB's
+// hydration can lag or stall (slow feeds, background tabs). Playwright's
+// isVisible() returns immediately (its timeout option is ignored), so one-shot
+// checks fail hard in that case. These constants control a real polling wait.
+const COMPOSER_WAIT_MS = Number.parseInt(
+  process.env.FB_COMPOSER_WAIT_MS || "45000",
+  10
+);
+// Hydration sometimes stalls indefinitely; one reload unsticks it.
+const RELOAD_AFTER_MS = Number.parseInt(
+  process.env.FB_RELOAD_AFTER_MS || "20000",
+  10
+);
 
 /** Best-effort HTML dump for debugging (enabled with FB_DEBUG_HTML=1). */
 async function dumpHtml(page: Page, tag: string): Promise<void> {
@@ -50,6 +70,51 @@ function isCommentBox(loc: Locator): Promise<boolean> {
       return COMMENT_LABEL_RE.test(label) || COMMENT_LABEL_RE.test(placeholder);
     })
     .catch(() => false);
+}
+
+interface ComposerTrigger {
+  composer: Locator;
+  isRawTextbox: boolean;
+}
+
+/**
+ * Polls the trigger candidates until one is visible. isVisible() cannot wait
+ * (its timeout option is ignored), so slow-loading groups need explicit
+ * polling. Reloads once after RELOAD_AFTER_MS without a match: hydration on
+ * some groups stalls for good and only a reload brings the composer up.
+ */
+async function findComposerTrigger(
+  page: Page,
+  candidates: Locator[]
+): Promise<{ trigger: ComposerTrigger | null; reloaded: boolean }> {
+  const deadline = Date.now() + COMPOSER_WAIT_MS;
+  const reloadAt =
+    RELOAD_AFTER_MS > 0 ? Date.now() + RELOAD_AFTER_MS : Infinity;
+  let reloaded = false;
+  while (Date.now() < deadline) {
+    for (let i = 0; i < candidates.length; i++) {
+      const candidate = candidates[i];
+      const visible = await candidate.isVisible().catch(() => false);
+      if (!visible) continue;
+
+      // Defense in depth: the raw-textbox fallback must not be a comment box
+      // (e.g. an unlabeled comment input on some layouts).
+      const isRawTextbox = i === candidates.length - 1;
+      if (isRawTextbox && (await isCommentBox(candidate))) continue;
+
+      return { trigger: { composer: candidate, isRawTextbox }, reloaded };
+    }
+
+    await page.waitForTimeout(500);
+
+    if (!reloaded && Date.now() >= reloadAt && Date.now() < deadline) {
+      reloaded = true;
+      await page
+        .reload({ waitUntil: "domcontentloaded", timeout: 30000 })
+        .catch(() => {});
+    }
+  }
+  return { trigger: null, reloaded };
 }
 
 export async function postToGroup(
@@ -93,49 +158,56 @@ export async function postToGroup(
         .first(),
     ];
 
-    let composerEl: Locator | null = null;
-    let inlineComposer = false;
-    for (let i = 0; i < triggerCandidates.length; i++) {
-      const candidate = triggerCandidates[i];
-      const visible = await candidate.isVisible({ timeout: 5000 }).catch(() => false);
-      if (!visible) continue;
-
-      // Defense in depth: the raw-textbox fallback must not be a comment box
-      // (e.g. an unlabeled comment input on some layouts).
-      if (i === triggerCandidates.length - 1 && (await isCommentBox(candidate))) {
-        continue;
-      }
-
-      composerEl = candidate;
-      // If it's already a textbox, we can type directly without clicking
-      const role = await candidate
-        .evaluate((el) => el.getAttribute("role"))
-        .catch(() => null);
-      inlineComposer = role === "textbox";
-      break;
-    }
+    // Poll for the trigger instead of checking once, so a lagging or stalled
+    // page load can't fail the post instantly.
+    const search = await findComposerTrigger(page, triggerCandidates);
+    const composerEl: Locator | null = search.trigger?.composer ?? null;
+    const inlineComposer = search.trigger?.isRawTextbox ?? false;
 
     if (!composerEl) {
       await dumpHtml(page, "composer-not-found");
-      // Gather page hints to help diagnose why the composer wasn't found
+      // A mid-wait reload can land on login/checkpoint if the session died.
+      const url = page.url();
+      if (url.includes("login") || url.includes("checkpoint")) {
+        return { success: false, message: "Not logged in to Facebook" };
+      }
+      // Gather page hints to help diagnose why the composer wasn't found.
+      // Deliberately match specific FB UI strings only — generic words like
+      // "pending"/"blocked"/"turned off" appear in ordinary posts and made
+      // these hints wildly misleading before.
       const bodyText = await page
         .locator("body")
         .textContent({ timeout: 3000 })
         .catch(() => "");
       const hints: string[] = [];
-      if (/pending|request to join|membership/i.test(bodyText ?? "")) {
+      if (
+        /request to join|طلب الانضمام|قيد المراجعة|قيد الموافقة|انضمامك قيد/i.test(
+          bodyText ?? ""
+        )
+      ) {
         hints.push("your membership may be pending approval");
       }
-      if (/only admins|posting is turned off|turned off|not allowed/i.test(bodyText ?? "")) {
+      if (
+        /only admins can post|posting is turned off|المشرفون فقط|المشرفين فقط|إيقاف تشغيل النشر|إيقاف النشر/i.test(
+          bodyText ?? ""
+        )
+      ) {
         hints.push("posting may be turned off for members");
       }
-      if (/you'?,?ve been blocked|muted/i.test(bodyText ?? "")) {
+      if (
+        /you'?,?ve been blocked|you are blocked|you'?,?re muted|تم حظرك|أنت محظور|تم كتمك/i.test(
+          bodyText ?? ""
+        )
+      ) {
         hints.push("you may be muted or blocked from this group");
       }
       const hint = hints.length ? ` (${hints.join("; ")})` : "";
+      const waited = ` after waiting ${Math.round(
+        COMPOSER_WAIT_MS / 1000
+      )}s${search.reloaded ? " (with one reload)" : ""}`;
       return {
         success: false,
-        message: `Could not find the post composer${hint}. If none apply, Facebook's layout may have changed or you don't have permission to post in this group.`,
+        message: `Could not find the post composer${waited}${hint}. If none apply, Facebook's layout may have changed or you don't have permission to post in this group.`,
       };
     }
 
@@ -145,13 +217,21 @@ export async function postToGroup(
     }
 
     const dialog = page.getByRole("dialog").first();
-    let dialogVisible = await dialog.isVisible({ timeout: 5000 }).catch(() => false);
+    // waitFor genuinely waits for the dialog to mount; isVisible's timeout
+    // option is ignored by Playwright.
+    let dialogVisible = await dialog
+      .waitFor({ state: "visible", timeout: 5000 })
+      .then(() => true)
+      .catch(() => false);
     if (!inlineComposer && !dialogVisible) {
       // The first click is sometimes swallowed while the feed is still
       // hydrating — retry once before giving up.
       await composerEl.click({ timeout: 5000 }).catch(() => {});
       await page.waitForTimeout(3000);
-      dialogVisible = await dialog.isVisible({ timeout: 5000 }).catch(() => false);
+      dialogVisible = await dialog
+        .waitFor({ state: "visible", timeout: 5000 })
+        .then(() => true)
+        .catch(() => false);
     }
 
     let textbox;
@@ -176,7 +256,8 @@ export async function postToGroup(
     }
 
     const textboxVisible = await textbox
-      .isVisible({ timeout: 5000 })
+      .waitFor({ state: "visible", timeout: 5000 })
+      .then(() => true)
       .catch(() => false);
 
     if (!textboxVisible) {
@@ -202,7 +283,8 @@ export async function postToGroup(
         .locator('[role="button"]')
         .filter({ hasText: new RegExp(expectedPageName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i") });
       const identityVisible = await identityCheck
-        .isVisible({ timeout: 2000 })
+        .waitFor({ state: "visible", timeout: 2000 })
+        .then(() => true)
         .catch(() => false);
       if (!identityVisible) {
         await page.keyboard.press("Escape");
@@ -290,7 +372,8 @@ export async function postToGroup(
             .first();
 
           const photoBtnVisible = await photoBtn
-            .isVisible({ timeout: 3000 })
+            .waitFor({ state: "visible", timeout: 3000 })
+            .then(() => true)
             .catch(() => false);
 
           if (photoBtnVisible) {
@@ -314,7 +397,8 @@ export async function postToGroup(
       .first();
 
     const postBtnVisible = await postBtn
-      .isVisible({ timeout: 5000 })
+      .waitFor({ state: "visible", timeout: 5000 })
+      .then(() => true)
       .catch(() => false);
 
     if (!postBtnVisible) {
@@ -346,9 +430,8 @@ export async function postToGroup(
     while (Date.now() < deadline) {
       await page.waitForTimeout(1500);
 
-      const dialogStillVisible = await dialog
-        .isVisible({ timeout: 1000 })
-        .catch(() => false);
+      // Fast non-blocking check is intended here — we poll on an interval.
+      const dialogStillVisible = await dialog.isVisible().catch(() => false);
       if (!dialogStillVisible) {
         return { success: true, message: "Post published successfully" };
       }
