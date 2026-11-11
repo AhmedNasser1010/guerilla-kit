@@ -25,6 +25,9 @@ export async function readCache(): Promise<CacheData> {
       manualGroups: Array.isArray(parsed.manualGroups)
         ? parsed.manualGroups
         : [],
+      collections: Array.isArray(parsed.collections)
+        ? parsed.collections
+        : [],
       pages: Array.isArray(parsed.pages) ? parsed.pages : [],
       lastUpdated: parsed.lastUpdated ?? null,
       selectedPageId: parsed.selectedPageId ?? null,

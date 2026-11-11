@@ -12,10 +12,16 @@ import {
   Search,
   CheckCircle2,
   Circle,
+  FolderOpen,
   LogIn,
   RefreshCw,
   Download,
   Columns3,
+  X,
+  StickyNote,
+  Trash2,
+  ListChecks,
+  FolderPlus,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
@@ -49,7 +55,7 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Header } from "@/components/dashboard/header"
 import { StatsBar } from "@/components/dashboard/stats-bar"
-import { Composer } from "@/components/dashboard/composer"
+import { Composer, type CollectionRunInfo } from "@/components/dashboard/composer"
 import {
   GroupCard,
   GroupListItem,
@@ -59,6 +65,7 @@ import {
 import type {
   Group,
   FacebookPage,
+  Collection,
   PostStatus,
   GroupDisplayStyle,
   GroupSortOrder,
@@ -74,6 +81,11 @@ import {
 } from "@/lib/export-columns"
 
 type GroupFilter = "all" | "posted" | "remaining"
+
+type CollectionDialogMode =
+  | { kind: "closed" }
+  | { kind: "create" }
+  | { kind: "manage"; collectionId: string | null }
 
 export function Dashboard() {
   const [groups, setGroups] = React.useState<Group[]>([])
@@ -93,6 +105,18 @@ export function Dashboard() {
   const [content, setContent] = React.useState("")
   const [imageFile, setImageFile] = React.useState<File | null>(null)
   const [postStatuses, setPostStatuses] = React.useState<Record<string, PostStatus>>({})
+  const [collections, setCollections] = React.useState<Collection[]>([])
+  const [activeCollectionId, setActiveCollectionId] = React.useState<string | null>(null)
+  const [collectionRun, setCollectionRun] = React.useState<CollectionRunInfo | null>(null)
+  const runStopRef = React.useRef(false)
+  const [selectionMode, setSelectionMode] = React.useState(false)
+  const [selectedGroupIds, setSelectedGroupIds] = React.useState<Set<string>>(
+    () => new Set()
+  )
+  const [collectionDialog, setCollectionDialog] = React.useState<CollectionDialogMode>({ kind: "closed" })
+  const [collectionNameInput, setCollectionNameInput] = React.useState("")
+  const [renameCollectionId, setRenameCollectionId] = React.useState<string | null>(null)
+  const [renameCollectionName, setRenameCollectionName] = React.useState("")
   const [loaded, setLoaded] = React.useState(false)
   const [loggedIn, setLoggedIn] = React.useState<boolean | null>(null)
   const [selectedGroupId, setSelectedGroupId] = React.useState<string | null>(null)
@@ -283,6 +307,7 @@ export function Dashboard() {
 
       setGroups(cache.groups || [])
       setManualGroups(cache.manualGroups || [])
+      setCollections(cache.collections || [])
       setPages(cache.pages || [])
       setSelectedPageId(cache.selectedPageId || null)
       setLastUpdated(cache.lastUpdated || null)
@@ -408,6 +433,7 @@ export function Dashboard() {
 
       setGroups(data.groups)
       setManualGroups(data.manualGroups || [])
+      setCollections(data.collections || [])
       setPages(data.pages)
       setLastUpdated(data.lastUpdated)
       toast.success(
@@ -452,6 +478,7 @@ export function Dashboard() {
       }
       setGroups(data.groups || [])
       setManualGroups(data.manualGroups || [])
+      setCollections(data.collections || [])
       setAddGroupOpen(false)
       setAddGroupUrl("")
       setAddGroupName("")
@@ -478,6 +505,7 @@ export function Dashboard() {
         return
       }
       setManualGroups(data.manualGroups || [])
+      setCollections(data.collections || [])
       if (selectedGroupId === groupId) setSelectedGroupId(null)
       toast.success("Manually added group removed")
     } catch {
@@ -610,11 +638,13 @@ export function Dashboard() {
     }
   }
 
-  async function postToGroup(group: Group) {
-    const existingStatus = postStatuses[group.id]
-    if (existingStatus?.status === "loading") return
+  // Scraped groups + manually added groups (scraped wins on id collision)
+  const allGroups = React.useMemo(() => {
+    const ids = new Set(groups.map((g) => g.id))
+    return [...groups, ...manualGroups.filter((g) => !ids.has(g.id))]
+  }, [groups, manualGroups])
 
-    setSelectedGroupId(group.id)
+  async function doPost(group: Group): Promise<boolean> {
     setPostStatuses((prev) => ({
       ...prev,
       [group.id]: { groupId: group.id, status: "loading" },
@@ -645,7 +675,7 @@ export function Dashboard() {
           },
         }))
         toast.error(result.error || "Failed to post")
-        return
+        return false
       }
 
       if (result.success) {
@@ -658,6 +688,7 @@ export function Dashboard() {
           },
         }))
         toast.success("Post published to " + group.name)
+        return true
       } else {
         setPostStatuses((prev) => ({
           ...prev,
@@ -668,6 +699,7 @@ export function Dashboard() {
           },
         }))
         toast.error(result.message || "Failed to post")
+        return false
       }
     } catch {
       setPostStatuses((prev) => ({
@@ -675,14 +707,197 @@ export function Dashboard() {
         [group.id]: { groupId: group.id, status: "error", message: "Network error" },
       }))
       toast.error("Network error while posting")
+      return false
     }
   }
 
-  // Scraped groups + manually added groups (scraped wins on id collision)
-  const allGroups = React.useMemo(() => {
-    const ids = new Set(groups.map((g) => g.id))
-    return [...groups, ...manualGroups.filter((g) => !ids.has(g.id))]
-  }, [groups, manualGroups])
+  async function postToGroup(group: Group) {
+    const existingStatus = postStatuses[group.id]
+    if (existingStatus?.status === "loading") return
+
+    setSelectedGroupId(group.id)
+    await doPost(group)
+  }
+
+  // --- Collections ---
+
+  async function collectionAction(
+    body: Record<string, unknown>,
+    successMsg?: string
+  ): Promise<boolean> {
+    try {
+      const res = await fetch("/api/collections", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        toast.error(data.error || "Failed to update collections")
+        return false
+      }
+      setCollections(data.collections || [])
+      if (successMsg) toast.success(successMsg)
+      return true
+    } catch {
+      toast.error("Failed to update collections")
+      return false
+    }
+  }
+
+  function toggleCollectionMember(groupId: string, collectionId: string) {
+    const collection = collections.find((c) => c.id === collectionId)
+    if (!collection) return
+    const isMember = collection.groupIds.includes(groupId)
+    return collectionAction({
+      action: isMember ? "removeGroups" : "addGroups",
+      id: collectionId,
+      groupIds: [groupId],
+    })
+  }
+
+  function toggleGroupSelection(groupId: string) {
+    setSelectedGroupIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(groupId)) {
+        next.delete(groupId)
+      } else {
+        next.add(groupId)
+      }
+      return next
+    })
+  }
+
+  function exitSelectionMode() {
+    setSelectionMode(false)
+    setSelectedGroupIds(new Set())
+  }
+
+  async function addSelectedToCollection(collectionId: string) {
+    const ids = [...selectedGroupIds]
+    if (ids.length === 0) {
+      toast.error("No groups selected")
+      return
+    }
+    const ok = await collectionAction(
+      { action: "addGroups", id: collectionId, groupIds: ids },
+      `Added ${ids.length} groups to the collection`
+    )
+    if (ok) exitSelectionMode()
+  }
+
+  async function createCollection() {
+    const name = collectionNameInput.trim()
+    if (!name) {
+      toast.error("Please enter a collection name")
+      return
+    }
+    const ok = await collectionAction({ action: "create", name })
+    if (ok) {
+      setCollectionNameInput("")
+      if (collectionDialog.kind === "create") setCollectionDialog({ kind: "closed" })
+    }
+  }
+
+  async function renameCollection(collectionId: string) {
+    const name = renameCollectionName.trim()
+    if (!name) {
+      toast.error("Please enter a collection name")
+      return
+    }
+    const ok = await collectionAction({ action: "rename", id: collectionId, name })
+    if (ok) setRenameCollectionId(null)
+  }
+
+  function deleteCollection(collectionId: string) {
+    const collection = collections.find((c) => c.id === collectionId)
+    if (!collection) return
+    if (!window.confirm(`Delete collection "${collection.name}"? Groups themselves are not removed.`)) return
+    if (activeCollectionId === collectionId) setActiveCollectionId(null)
+    return collectionAction({ action: "delete", id: collectionId }, "Collection deleted")
+  }
+
+  function stopCollectionRun() {
+    runStopRef.current = true
+  }
+
+  async function postToCollection(collectionId: string, skipPosted: boolean) {
+    if (collectionRun) return
+    if (!content.trim()) {
+      toast.error("Write your post content first")
+      return
+    }
+
+    const collection = collections.find((c) => c.id === collectionId)
+    if (!collection) {
+      toast.error("Collection not found")
+      return
+    }
+
+    const members = collection.groupIds
+      .map((id) => allGroups.find((g) => g.id === id))
+      .filter((g): g is Group => !!g && !hiddenIds[g.id])
+    if (members.length === 0) {
+      toast.error("This collection has no groups in your list")
+      return
+    }
+
+    const targets: Group[] = []
+    let skipped = 0
+    if (skipPosted) {
+      members.forEach((g) => {
+        if (postedIds[g.id]) skipped++
+        else targets.push(g)
+      })
+    } else {
+      targets.push(...members)
+    }
+
+    if (targets.length === 0) {
+      toast.info(
+        `All ${members.length} groups in "${collection.name}" are already marked as posted`
+      )
+      return
+    }
+
+    runStopRef.current = false
+    const run: CollectionRunInfo = {
+      collectionId: collection.id,
+      name: collection.name,
+      current: 0,
+      total: targets.length,
+      success: 0,
+      failed: 0,
+      skipped,
+    }
+    setCollectionRun(run)
+
+    let success = 0
+    let failed = 0
+    let stopped = false
+    for (let i = 0; i < targets.length; i++) {
+      if (runStopRef.current) {
+        stopped = true
+        break
+      }
+      setCollectionRun((prev) => (prev ? { ...prev, current: i + 1 } : prev))
+      const ok = await doPost(targets[i])
+      if (ok) success++
+      else failed++
+      setCollectionRun((prev) =>
+        prev ? { ...prev, success, failed, skipped } : prev
+      )
+    }
+
+    setCollectionRun(null)
+
+    const summary = `Collection "${collection.name}": ${success} posted, ${failed} failed${
+      skipped ? `, ${skipped} skipped (already posted)` : ""
+    }`
+    if (stopped) toast.info(summary + " — stopped early")
+    else if (failed === 0) toast.success(summary)
+    else toast.error(summary)
+  }
 
   const visibleGroups = allGroups.filter((g) => !hiddenIds[g.id])
   const hiddenGroups = allGroups.filter((g) => hiddenIds[g.id])
@@ -691,8 +906,20 @@ export function Dashboard() {
     [manualGroups]
   )
 
+  const activeCollection =
+    collections.find((c) => c.id === activeCollectionId) || null
+  const activeCollectionMemberIds = React.useMemo(
+    () => new Set(activeCollection?.groupIds || []),
+    [activeCollection]
+  )
+
   const filteredGroups = sortGroups(
     visibleGroups.filter((g) => {
+      if (
+        activeCollection &&
+        !activeCollectionMemberIds.has(g.id)
+      )
+        return false
       const matchesSearch = g.name
         .toLowerCase()
         .includes(searchQuery.toLowerCase())
@@ -853,6 +1080,10 @@ export function Dashboard() {
               disabled={!loggedIn || (!!selectedGroupId && !selectedGroup)}
               groupId={selectedGroupId}
               onClearSelection={() => setSelectedGroupId(null)}
+              collections={collections}
+              onPostToCollection={postToCollection}
+              collectionRun={collectionRun}
+              onStopRun={stopCollectionRun}
             />
 
             <Separator className="my-8" />
@@ -892,6 +1123,18 @@ export function Dashboard() {
                     </button>
                   ))}
                 </div>
+
+                {activeCollection && (
+                  <button
+                    onClick={() => setActiveCollectionId(null)}
+                    title="Clear collection filter"
+                    className="flex h-7 items-center gap-1.5 rounded-full border bg-primary/10 px-3 text-xs font-medium text-primary transition-colors hover:bg-primary/20"
+                  >
+                    <FolderOpen className="size-3" />
+                    <span className="max-w-32 truncate">{activeCollection.name}</span>
+                    <X className="size-3" />
+                  </button>
+                )}
 
                 <DropdownMenu>
                   <DropdownMenuTrigger
@@ -971,6 +1214,72 @@ export function Dashboard() {
                   </DropdownMenuContent>
                 </DropdownMenu>
 
+                <DropdownMenu>
+                  <DropdownMenuTrigger
+                    render={<Button variant="outline" size="sm" />}
+                  >
+                    <FolderOpen />
+                    Collections
+                    <Badge
+                      variant="secondary"
+                      className="ml-0.5 h-4 px-1 text-[10px] tabular-nums"
+                    >
+                      {collections.length}
+                    </Badge>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="min-w-56">
+                    <DropdownMenuGroup>
+                      <DropdownMenuLabel>Filter by collection</DropdownMenuLabel>
+                      <DropdownMenuSeparator />
+                      {collections.length === 0 ? (
+                        <DropdownMenuItem disabled>
+                          No collections yet
+                        </DropdownMenuItem>
+                      ) : (
+                        collections.map((collection) => (
+                          <DropdownMenuItem
+                            key={collection.id}
+                            onClick={() =>
+                              setActiveCollectionId(
+                                activeCollectionId === collection.id
+                                  ? null
+                                  : collection.id
+                              )
+                            }
+                          >
+                            {activeCollectionId === collection.id && "✓ "}
+                            {collection.name}
+                            <span className="ml-auto text-xs text-muted-foreground">
+                              {collection.groupIds.length}
+                            </span>
+                          </DropdownMenuItem>
+                        ))
+                      )}
+                    </DropdownMenuGroup>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      onClick={() => {
+                        setCollectionNameInput("")
+                        setCollectionDialog({ kind: "create" })
+                      }}
+                    >
+                      New collection…
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onClick={() => {
+                        setRenameCollectionId(null)
+                        setCollectionDialog({
+                          kind: "manage",
+                          collectionId: activeCollectionId,
+                        })
+                      }}
+                      disabled={collections.length === 0}
+                    >
+                      Manage collections
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+
                 <div
                   className="flex items-center rounded-full border bg-card p-0.5"
                   role="group"
@@ -997,6 +1306,100 @@ export function Dashboard() {
                     <List />
                   </Button>
                 </div>
+
+                <Button
+                  variant="outline"
+                  size="sm"
+                  aria-pressed={selectionMode}
+                  onClick={() => {
+                    if (selectionMode) exitSelectionMode()
+                    else setSelectionMode(true)
+                  }}
+                  title="Select multiple groups, then add them all to a collection at once"
+                >
+                  <ListChecks />
+                  Select
+                </Button>
+
+                {selectionMode && (
+                  <>
+                    <Badge
+                      variant="secondary"
+                      className="tabular-nums"
+                      title="Selected groups"
+                    >
+                      {selectedGroupIds.size} selected
+                    </Badge>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={filteredGroups.length === 0}
+                      onClick={() =>
+                        setSelectedGroupIds(
+                          new Set(filteredGroups.map((g) => g.id))
+                        )
+                      }
+                      title="Select every group matching the current search/filter"
+                    >
+                      <CheckCircle2 />
+                      Select all ({filteredGroups.length})
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={selectedGroupIds.size === 0}
+                      onClick={() => setSelectedGroupIds(new Set())}
+                    >
+                      Clear
+                    </Button>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger
+                        render={
+                          <Button
+                            size="sm"
+                            disabled={
+                              selectedGroupIds.size === 0 ||
+                              collections.length === 0
+                            }
+                            title={
+                              collections.length === 0
+                                ? "Create a collection first from the Collections menu"
+                                : "Add the selected groups to a collection"
+                            }
+                          />
+                        }
+                      >
+                        <FolderPlus />
+                        Add to collection
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="start" className="min-w-56">
+                        <DropdownMenuGroup>
+                          <DropdownMenuLabel>
+                            Add {selectedGroupIds.size} group
+                            {selectedGroupIds.size === 1 ? "" : "s"} to…
+                          </DropdownMenuLabel>
+                          <DropdownMenuSeparator />
+                          {collections.map((collection) => (
+                            <DropdownMenuItem
+                              key={collection.id}
+                              onClick={() =>
+                                addSelectedToCollection(collection.id)
+                              }
+                            >
+                              {collection.name}
+                              <span className="ml-auto text-xs text-muted-foreground">
+                                {collection.groupIds.length}
+                              </span>
+                            </DropdownMenuItem>
+                          ))}
+                        </DropdownMenuGroup>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                    <Button variant="ghost" size="sm" onClick={exitSelectionMode}>
+                      Done
+                    </Button>
+                  </>
+                )}
               </div>
 
               {lastUpdated && (
@@ -1057,9 +1460,22 @@ export function Dashboard() {
                     flags={groupFlags[group.id] || {}}
                     onSetFlag={(f, a) => setGroupFlag(group.id, f, a)}
                     onRemoveFlag={(f) => removeGroupFlag(group.id, f)}
-                              onSelect={() => setSelectedGroupId(group.id)}
+                              onSelect={() =>
+                                 selectionMode
+                                   ? toggleGroupSelection(group.id)
+                                   : setSelectedGroupId(group.id)
+                               }
                               isManual={manualIds.has(group.id)}
                               onRemove={() => removeManualGroup(group.id)}
+                               collections={collections}
+                               onToggleCollection={(cid) =>
+                                 toggleCollectionMember(group.id, cid)
+                               }
+                               showSelection={selectionMode}
+                               selectionChecked={selectedGroupIds.has(group.id)}
+                               onToggleSelect={() =>
+                                 toggleGroupSelection(group.id)
+                               }
                   />
                 ))}
               </div>
@@ -1083,9 +1499,22 @@ export function Dashboard() {
                     flags={groupFlags[group.id] || {}}
                     onSetFlag={(f, a) => setGroupFlag(group.id, f, a)}
                     onRemoveFlag={(f) => removeGroupFlag(group.id, f)}
-                              onSelect={() => setSelectedGroupId(group.id)}
+                              onSelect={() =>
+                                 selectionMode
+                                   ? toggleGroupSelection(group.id)
+                                   : setSelectedGroupId(group.id)
+                               }
                               isManual={manualIds.has(group.id)}
                               onRemove={() => removeManualGroup(group.id)}
+                               collections={collections}
+                               onToggleCollection={(cid) =>
+                                 toggleCollectionMember(group.id, cid)
+                               }
+                               showSelection={selectionMode}
+                               selectionChecked={selectedGroupIds.has(group.id)}
+                               onToggleSelect={() =>
+                                 toggleGroupSelection(group.id)
+                               }
                   />
                 ))}
               </div>
@@ -1147,9 +1576,17 @@ export function Dashboard() {
                               flags={groupFlags[group.id] || {}}
                               onSetFlag={(f, a) => setGroupFlag(group.id, f, a)}
                               onRemoveFlag={(f) => removeGroupFlag(group.id, f)}
-                              onSelect={() => setSelectedGroupId(group.id)}
+                              onSelect={() =>
+                                 selectionMode
+                                   ? toggleGroupSelection(group.id)
+                                   : setSelectedGroupId(group.id)
+                               }
                               isManual={manualIds.has(group.id)}
                               onRemove={() => removeManualGroup(group.id)}
+                               collections={collections}
+                               onToggleCollection={(cid) =>
+                                 toggleCollectionMember(group.id, cid)
+                               }
                             />
                           ))}
                         </div>
@@ -1173,9 +1610,17 @@ export function Dashboard() {
                               flags={groupFlags[group.id] || {}}
                               onSetFlag={(f, a) => setGroupFlag(group.id, f, a)}
                               onRemoveFlag={(f) => removeGroupFlag(group.id, f)}
-                              onSelect={() => setSelectedGroupId(group.id)}
+                              onSelect={() =>
+                                 selectionMode
+                                   ? toggleGroupSelection(group.id)
+                                   : setSelectedGroupId(group.id)
+                               }
                               isManual={manualIds.has(group.id)}
                               onRemove={() => removeManualGroup(group.id)}
+                               collections={collections}
+                               onToggleCollection={(cid) =>
+                                 toggleCollectionMember(group.id, cid)
+                               }
                             />
                           ))}
                         </div>
@@ -1247,6 +1692,230 @@ export function Dashboard() {
             </Button>
             <Button onClick={addManualGroup} disabled={addingGroup}>
               {addingGroup ? "Adding..." : "Add group"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* create collection dialog */}
+      <Dialog
+        open={collectionDialog.kind === "create"}
+        onOpenChange={(open) => {
+          if (!open) setCollectionDialog({ kind: "closed" })
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>New collection</DialogTitle>
+            <DialogDescription>
+              A collection bundles groups together (e.g. &quot;العياط&quot;,
+              &quot;برنشت&quot;) so you can post to all of them with one
+              click. Add groups to it afterwards from each group&apos;s
+              collections menu.
+            </DialogDescription>
+          </DialogHeader>
+          <Input
+            placeholder="Collection name"
+            value={collectionNameInput}
+            onChange={(e) => setCollectionNameInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") createCollection()
+            }}
+            aria-label="Collection name"
+            autoFocus
+          />
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setCollectionDialog({ kind: "closed" })}
+            >
+              Cancel
+            </Button>
+            <Button onClick={createCollection} disabled={!collectionNameInput.trim()}>
+              Create collection
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* manage collections dialog */}
+      <Dialog
+        open={collectionDialog.kind === "manage"}
+        onOpenChange={(open) => {
+          if (!open) {
+            setRenameCollectionId(null)
+            setCollectionDialog({ kind: "closed" })
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Manage collections</DialogTitle>
+            <DialogDescription>
+              Create, rename or delete collections, and pick which groups
+              belong to them. Click a collection to edit its members.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            {/* create row */}
+            <div className="flex gap-2">
+              <Input
+                placeholder="New collection name"
+                value={collectionNameInput}
+                onChange={(e) => setCollectionNameInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") createCollection()
+                }}
+                aria-label="New collection name"
+              />
+              <Button
+                onClick={createCollection}
+                disabled={!collectionNameInput.trim()}
+              >
+                Create
+              </Button>
+            </div>
+
+            {/* collections list */}
+            <div className="max-h-40 space-y-1 overflow-auto rounded border p-2">
+              {collections.length === 0 && (
+                <p className="py-2 text-center text-sm text-muted-foreground">
+                  No collections yet.
+                </p>
+              )}
+              {collections.map((collection) => {
+                const isSelected =
+                  collectionDialog.kind === "manage" &&
+                  collectionDialog.collectionId === collection.id
+                if (renameCollectionId === collection.id) {
+                  return (
+                    <div key={collection.id} className="flex items-center gap-2 py-1">
+                      <Input
+                        value={renameCollectionName}
+                        onChange={(e) => setRenameCollectionName(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") renameCollection(collection.id)
+                        }}
+                        aria-label={`New name for ${collection.name}`}
+                        autoFocus
+                      />
+                      <Button size="sm" onClick={() => renameCollection(collection.id)}>
+                        Save
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setRenameCollectionId(null)}
+                      >
+                        Cancel
+                      </Button>
+                    </div>
+                  )
+                }
+                return (
+                  <div
+                    key={collection.id}
+                    className={
+                      "flex items-center gap-2 rounded px-2 py-1 " +
+                      (isSelected ? "bg-primary/10" : "hover:bg-muted/60")
+                    }
+                  >
+                    <button
+                      className="min-w-0 flex-1 truncate text-left text-sm"
+                      title={collection.name}
+                      onClick={() => {
+                        if (collectionDialog.kind === "manage") {
+                          setCollectionDialog({
+                            kind: "manage",
+                            collectionId: isSelected ? null : collection.id,
+                          })
+                        }
+                      }}
+                    >
+                      {collection.name}
+                    </button>
+                    <Badge variant="secondary" className="shrink-0 tabular-nums">
+                      {collection.groupIds.length}
+                    </Badge>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      title="Rename collection"
+                      aria-label={`Rename ${collection.name}`}
+                      onClick={() => {
+                        setRenameCollectionId(collection.id)
+                        setRenameCollectionName(collection.name)
+                      }}
+                    >
+                      <StickyNote />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      title="Delete collection"
+                      aria-label={`Delete ${collection.name}`}
+                      className="text-destructive hover:text-destructive"
+                      onClick={() => deleteCollection(collection.id)}
+                    >
+                      <Trash2 />
+                    </Button>
+                  </div>
+                )
+              })}
+            </div>
+
+            {/* members editor for the selected collection */}
+            {collectionDialog.kind === "manage" &&
+              collectionDialog.collectionId && (
+                <div>
+                  <p className="mb-1 text-xs font-medium text-muted-foreground">
+                    Members of{" "}
+                    {collections.find(
+                      (c) => c.id === collectionDialog.collectionId
+                    )?.name || ""}
+                  </p>
+                  <div className="max-h-64 overflow-auto rounded border p-2">
+                    {allGroups.map((group) => {
+                      const collection = collections.find(
+                        (c) => c.id === collectionDialog.collectionId
+                      )
+                      const isMember = !!collection?.groupIds.includes(group.id)
+                      return (
+                        <label
+                          key={group.id}
+                          className="flex cursor-pointer items-center gap-2 rounded px-2 py-1 text-sm hover:bg-muted/60"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={isMember}
+                            onChange={() =>
+                              toggleCollectionMember(
+                                group.id,
+                                collectionDialog.collectionId!
+                              )
+                            }
+                            className="size-3.5 cursor-pointer accent-primary"
+                            aria-label={`Toggle ${group.name} in collection`}
+                          />
+                          <span className="truncate">{group.name}</span>
+                        </label>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
+          </div>
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setRenameCollectionId(null)
+                setCollectionDialog({ kind: "closed" })
+              }}
+            >
+              Done
             </Button>
           </DialogFooter>
         </DialogContent>

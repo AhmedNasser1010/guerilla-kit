@@ -12,6 +12,7 @@ import {
   EyeOff,
   Eye,
   StickyNote,
+  FolderPlus,
   Check,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
@@ -25,12 +26,14 @@ import {
   DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuSeparator,
+  DropdownMenuCheckboxItem,
   DropdownMenuSub,
   DropdownMenuSubTrigger,
   DropdownMenuSubContent,
 } from "@/components/ui/dropdown-menu"
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
 import type {
+  Collection,
   Group,
   GroupFlagAccount,
   GroupFlagId,
@@ -305,6 +308,58 @@ export function GroupFlagMenuButton({
   )
 }
 
+export function GroupCollectionsMenuButton({
+  group,
+  collections,
+  onToggleCollection,
+}: {
+  group: Group
+  collections: Collection[]
+  onToggleCollection: (collectionId: string) => void
+}) {
+  const memberOf = collections.filter((c) => c.groupIds.includes(group.id))
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        render={
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            title="Manage collections"
+            aria-label={`Manage collections for ${group.name}`}
+          />
+        }
+      >
+        <FolderPlus
+          className={memberOf.length > 0 ? "fill-indigo-400 text-indigo-500" : ""}
+        />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="min-w-44">
+        <DropdownMenuGroup>
+          <DropdownMenuLabel>Collections</DropdownMenuLabel>
+          <DropdownMenuSeparator />
+          {collections.length === 0 ? (
+            <DropdownMenuItem disabled>
+              No collections yet — create one from the toolbar
+            </DropdownMenuItem>
+          ) : (
+            collections.map((collection) => (
+              <DropdownMenuCheckboxItem
+                key={collection.id}
+                checked={memberOf.some((c) => c.id === collection.id)}
+                closeOnClick={false}
+                onCheckedChange={() => onToggleCollection(collection.id)}
+              >
+                {collection.name}
+              </DropdownMenuCheckboxItem>
+            ))
+          )}
+        </DropdownMenuGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
 export function GroupCard({
   group,
   index,
@@ -324,6 +379,11 @@ export function GroupCard({
   onSelect,
   isManual,
   onRemove,
+  collections,
+  onToggleCollection,
+  showSelection,
+  selectionChecked,
+  onToggleSelect,
 }: {
   group: Group
   index: number
@@ -343,6 +403,11 @@ export function GroupCard({
   onSelect?: () => void
   isManual?: boolean
   onRemove?: () => void
+  collections?: Collection[]
+  onToggleCollection?: (collectionId: string) => void
+  showSelection?: boolean
+  selectionChecked?: boolean
+  onToggleSelect?: () => void
 }) {
   const [noteOpen, setNoteOpen] = React.useState(false)
   const hasError = status?.status === "error"
@@ -373,6 +438,15 @@ export function GroupCard({
       )}
 
       <div className="flex items-start gap-3">
+        {showSelection && onToggleSelect && (
+          <input
+            type="checkbox"
+            checked={!!selectionChecked}
+            onChange={onToggleSelect}
+            className="mt-1 size-4 shrink-0 cursor-pointer accent-primary"
+            aria-label={`Select ${group.name}`}
+          />
+        )}
         <Avatar className="size-10 shrink-0 ring-1 ring-border">
           <AvatarImage src={group.logoUrl} />
           <AvatarFallback>{group.name.charAt(0).toUpperCase()}</AvatarFallback>
@@ -443,6 +517,13 @@ export function GroupCard({
           Post
         </Button>
         <GroupFlagMenuButton flags={flags} onSetFlag={onSetFlag} />
+        {collections && onToggleCollection && (
+          <GroupCollectionsMenuButton
+            group={group}
+            collections={collections}
+            onToggleCollection={onToggleCollection}
+          />
+        )}
         <Button
           variant="ghost"
           size="icon-sm"
@@ -519,6 +600,11 @@ export function GroupListItem({
   onSelect,
   isManual,
   onRemove,
+  collections,
+  onToggleCollection,
+  showSelection,
+  selectionChecked,
+  onToggleSelect,
 }: {
   group: Group
   index: number
@@ -538,6 +624,11 @@ export function GroupListItem({
   onSelect?: () => void
   isManual?: boolean
   onRemove?: () => void
+  collections?: Collection[]
+  onToggleCollection?: (collectionId: string) => void
+  showSelection?: boolean
+  selectionChecked?: boolean
+  onToggleSelect?: () => void
 }) {
   function handleCardClick(e: React.MouseEvent<HTMLDivElement>) {
     if (!onSelect) return
@@ -557,6 +648,15 @@ export function GroupListItem({
       <span className="hidden w-8 shrink-0 text-xs tabular-nums text-muted-foreground sm:block">
         #{index}
       </span>
+      {showSelection && onToggleSelect && (
+        <input
+          type="checkbox"
+          checked={!!selectionChecked}
+          onChange={onToggleSelect}
+          className="shrink-0 cursor-pointer accent-primary"
+          aria-label={`Select ${group.name}`}
+        />
+      )}
       <Avatar className="size-9 shrink-0 ring-1 ring-border">
         <AvatarImage src={group.logoUrl} />
         <AvatarFallback className="text-sm">
@@ -623,6 +723,14 @@ export function GroupListItem({
       </Button>
 
       <GroupFlagMenuButton flags={flags} onSetFlag={onSetFlag} />
+
+      {collections && onToggleCollection && (
+        <GroupCollectionsMenuButton
+          group={group}
+          collections={collections}
+          onToggleCollection={onToggleCollection}
+        />
+      )}
 
       <Button
         variant="ghost"

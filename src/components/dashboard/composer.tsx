@@ -1,11 +1,30 @@
 "use client"
 
 import * as React from "react"
-import { ImageIcon, Send, X } from "lucide-react"
+import { FolderDown, ImageIcon, Send, Square, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { Badge } from "@/components/ui/badge"
-import type { Group, PostStatus } from "@/lib/types"
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuLabel,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu"
+import type { Collection, Group, PostStatus } from "@/lib/types"
+
+export interface CollectionRunInfo {
+  collectionId: string
+  name: string
+  current: number
+  total: number
+  success: number
+  failed: number
+  skipped: number
+}
 
 export function Composer({
   content,
@@ -19,6 +38,10 @@ export function Composer({
   disabled,
   groupId,
   onClearSelection,
+  collections,
+  onPostToCollection,
+  collectionRun,
+  onStopRun,
 }: {
   content: string
   setContent: (v: string) => void
@@ -31,8 +54,13 @@ export function Composer({
   disabled: boolean
   groupId: string | null
   onClearSelection: () => void
+  collections: Collection[]
+  onPostToCollection: (collectionId: string, skipPosted: boolean) => void
+  collectionRun: CollectionRunInfo | null
+  onStopRun: () => void
 }) {
   const fileInputRef = React.useRef<HTMLInputElement>(null)
+  const [skipPosted, setSkipPosted] = React.useState(true)
 
   const previewUrl = React.useMemo(
     () => (imageFile ? URL.createObjectURL(imageFile) : null),
@@ -45,7 +73,7 @@ export function Composer({
     }
   }, [previewUrl])
 
-  const canPost = !disabled && !!content.trim() && !posting
+  const canPost = !disabled && !!content.trim() && !posting && !collectionRun
 
   return (
     <section
@@ -88,7 +116,8 @@ export function Composer({
         {!groupId && (
           <p className="mb-3 text-sm text-muted-foreground">
             Select a group by clicking <strong>Post</strong> on its card, then
-            publish your content here.
+            publish your content here — or post to a whole collection at once
+            from the button below.
           </p>
         )}
 
@@ -138,11 +167,24 @@ export function Composer({
               variant="ghost"
               size="sm"
               onClick={() => fileInputRef.current?.click()}
-              disabled={disabled}
+              disabled={disabled || !!collectionRun}
             >
               <ImageIcon />
               {imageFile ? "Replace image" : "Add image"}
             </Button>
+            <label
+              className="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground"
+              title="Groups you already marked as posted will be skipped"
+            >
+              <input
+                type="checkbox"
+                checked={skipPosted}
+                onChange={(e) => setSkipPosted(e.target.checked)}
+                className="size-3.5 cursor-pointer accent-primary"
+                aria-label="Skip already-posted groups in collection runs"
+              />
+              Skip posted
+            </label>
             <span className="text-xs tabular-nums text-muted-foreground">
               {content.length} chars
             </span>
@@ -159,18 +201,85 @@ export function Composer({
                 {postStatus.message}
               </p>
             )}
-            <Button
-              onClick={onPost}
-              disabled={!canPost}
-              className="shadow-md shadow-primary/20 transition-transform active:scale-[0.98]"
-            >
-              {posting ? <Send className="animate-pulse" /> : <Send />}
-              {posting
-                ? "Posting…"
-                : groupId
-                  ? "Post to Group"
-                  : "Select a group to post"}
-            </Button>
+
+            {collectionRun ? (
+              <>
+                <span className="flex items-center gap-2 text-xs tabular-nums text-muted-foreground">
+                  <span className="size-2 animate-pulse rounded-full bg-primary" />
+                  {collectionRun.name}: {collectionRun.current}/{collectionRun.total}
+                  {collectionRun.failed > 0 && (
+                    <span className="text-destructive">
+                      ({collectionRun.failed} failed)
+                    </span>
+                  )}
+                </span>
+                <Button
+                  variant="destructive"
+                  onClick={onStopRun}
+                  className="shadow-md shadow-destructive/20"
+                >
+                  <Square />
+                  Stop
+                </Button>
+              </>
+            ) : (
+              <>
+                <DropdownMenu>
+                  <DropdownMenuTrigger
+                    render={
+                      <Button
+                        variant="outline"
+                        disabled={
+                          disabled ||
+                          !content.trim() ||
+                          collections.length === 0 ||
+                          posting
+                        }
+                        title={
+                          collections.length === 0
+                            ? "Create a collection from the Collections menu in the toolbar"
+                            : "Post to every group in a collection, one by one"
+                        }
+                      />
+                    }
+                  >
+                    <FolderDown />
+                    Post to collection
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="min-w-56">
+                    <DropdownMenuGroup>
+                      <DropdownMenuLabel>Post to collection</DropdownMenuLabel>
+                      <DropdownMenuSeparator />
+                      {collections.map((collection) => (
+                        <DropdownMenuItem
+                          key={collection.id}
+                          onClick={() =>
+                            onPostToCollection(collection.id, skipPosted)
+                          }
+                        >
+                          {collection.name}
+                          <span className="ml-auto text-xs text-muted-foreground">
+                            {collection.groupIds.length} groups
+                          </span>
+                        </DropdownMenuItem>
+                      ))}
+                    </DropdownMenuGroup>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+                <Button
+                  onClick={onPost}
+                  disabled={!canPost}
+                  className="shadow-md shadow-primary/20 transition-transform active:scale-[0.98]"
+                >
+                  {posting ? <Send className="animate-pulse" /> : <Send />}
+                  {posting
+                    ? "Posting…"
+                    : groupId
+                      ? "Post to Group"
+                      : "Select a group to post"}
+                </Button>
+              </>
+            )}
           </div>
         </div>
       </div>

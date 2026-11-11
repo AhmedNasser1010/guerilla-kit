@@ -30,6 +30,16 @@ export type GroupFlagAccount = "page" | "personal"
 // to the group regardless of which account is used
 export type GroupFlagsMap = Partial<Record<GroupFlagId, GroupFlagAccount[] | "global">>
 
+/**
+ * A named collection of groups (e.g. "العياط") the user can post to in one
+ * click. groupIds are ordered — posting to a collection follows this order.
+ */
+export interface Collection {
+  id: string;
+  name: string;
+  groupIds: string[];
+}
+
 export type GroupDisplayStyle = "grid" | "list";
 
 export type GroupSortOrder =
@@ -46,6 +56,11 @@ export interface CacheData {
    * overwritten by the scraper.
    */
   manualGroups: Group[];
+  /**
+   * Named collections of groups (user-curated). Stored in the cache and
+   * never touched by scraping, so memberships survive refreshes.
+   */
+  collections: Collection[];
   pages: FacebookPage[];
   lastUpdated: string | null;
   selectedPageId: string | null;
@@ -60,6 +75,7 @@ export interface PostStatus {
 export const EMPTY_CACHE: CacheData = {
   groups: [],
   manualGroups: [],
+  collections: [],
   pages: [],
   lastUpdated: null,
   selectedPageId: null,
