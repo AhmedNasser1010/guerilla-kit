@@ -1,4 +1,4 @@
-import type { BrowserContext } from "playwright";
+import type { BrowserContext, Locator, Page } from "playwright";
 import type { Group } from "../types";
 
 /** Convert Arabic-Indic digits (٠-٩) and Arabic thousands/scale words to a
@@ -27,7 +27,11 @@ const PRIVACY_RE = /مجموعة (?:عامة|خاصة)|\b(?:public|private) grou
 const MEMBER_RE =
   /([٠-٩\d.,٫]*[٠-٩\d][٠-٩\d.,٫]*(?:\s*[KkMmأ])?(?:\s*(?:(?:أ|آ|ا)?ل(?:ا)?ف(?:ات)?|مليون))?)\s*(?:members?|أعضاء|عضو)/i;
 
-async function dismissDialogs(page: any): Promise<void> {
+// Global variant used with matchAll() when a text holds several member
+// counts and we need to compare them instead of trusting the leftmost one.
+const MEMBER_RE_G = new RegExp(MEMBER_RE.source, "gi");
+
+async function dismissDialogs(page: Page): Promise<void> {
   const selectors = [
     'div[role="dialog"] button[aria-label="Close"]',
     'div[role="dialog"] [aria-label="Close"]',
@@ -77,6 +81,74 @@ export async function scrapeGroups(
     else onProgress?.({ phase, current, total });
   };
   const page = await context.newPage();
+
+  // Hover-scan helpers. Everything here runs inside the browser page (where
+  // Node module constants don't exist), so the regexes are duplicated
+  // inline on purpose.
+  //
+  // Root-cause of the mixed-up member counts: stale hovercards from
+  // previously hovered groups stay mounted in the DOM (merely hidden), so
+  // scanning the whole document picks up the *previous* group's popup.
+  // The fix has two halves:
+  //   1. tagExistingTipContainers(): right BEFORE hovering, mark every
+  //      element whose text carries group info with data-tip-scanned.
+  //   2. readFreshTip(): after the hover, only accept UNTAGGED containers —
+  //      i.e. nodes mounted after the hover — skipping hidden ones. This
+  //      guarantees the captured text belongs to the group currently being
+  //      hovered, never to a leftover popup.
+  const tagExistingTipContainers = () =>
+    page.evaluate(() => {
+      const norm = (t: string | null) =>
+        (t || "")
+          .replace(/[\u200e\u200f]/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+      const win =
+        /مجموعة (?:عامة|خاصة)|public group|private group|members|أعضاء|عضو/i;
+      for (const el of document.querySelectorAll(
+        "div,span,section,article,aside,li"
+      )) {
+        const t = norm(el.textContent);
+        if (!t || !win.test(t)) continue;
+        el.setAttribute("data-tip-scanned", "1");
+      }
+    });
+
+  const readFreshTip = () =>
+    page.evaluate(() => {
+      const norm = (t: string | null) =>
+        (t || "")
+          .replace(/[\u200e\u200f]/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+      const win =
+        /مجموعة (?:عامة|خاصة)|public group|private group|members|أعضاء|عضو/i;
+      const out: string[] = [];
+      for (const el of document.querySelectorAll(
+        "div,span,section,article,aside,li"
+      )) {
+        const t = norm(el.textContent);
+        if (!t || !win.test(t)) continue;
+        // Content tagged pre-hover (stale popups, list cards) never counts.
+        if (el.getAttribute("data-tip-scanned")) continue;
+        // Skip anything not visible — hidden stale popups must never be
+        // read as the "current" popup even if they slip through untagged.
+        const vis = el as HTMLElement & { checkVisibility?: () => boolean };
+        if (typeof vis.checkVisibility === "function" && !vis.checkVisibility())
+          continue;
+        let childHas = false;
+        for (const c of el.children) {
+          if (win.test(norm(c.textContent))) {
+            childHas = true;
+            break;
+          }
+        }
+        if (childHas) continue;
+        out.push(t);
+        if (out.length >= 3) break;
+      }
+      return out.join(" | ");
+    });
   try {
     // "Display all" (عرض الكل) page listing every group the account has joined.
     // The plain /groups/ URL only shows the feed and yields unrelated links.
@@ -221,6 +293,11 @@ export async function scrapeGroups(
       id: string;
       name: string;
       joinedText: string;
+      // Text captured from the hovercard popup of this exact card. Kept
+      // separate from the card text: the popup is scoped to freshly-mounted
+      // DOM nodes, while the card text can spill past the card boundary and
+      // carry a neighboring group's member count.
+      tip: string;
       logoUrl: string;
       href: string;
     };
@@ -250,8 +327,11 @@ export async function scrapeGroups(
         // for every card that is still missing either marker. `knownText`
         // reuses what we already captured in a previous round so already
         // enriched groups don't get hovered again while scrolling.
+        const known = entriesMap.get(entry.id);
         const knownText =
-          entriesMap.get(entry.id)?.joinedText || entry.joinedText;
+          [known?.joinedText, known?.tip].filter(Boolean).join(" ") ||
+          entry.joinedText;
+        let tip = "";
         if (!(MEMBER_RE.test(knownText) && PRIVACY_RE.test(knownText))) {
           if (options.signal?.aborted) throw new Error("Aborted");
           report("hovering", entriesMap.size);
@@ -260,62 +340,58 @@ export async function scrapeGroups(
             // is often hidden (cover photo clone) and .hover() would waste its
             // whole timeout without moving the pointer. Try every anchor
             // (bounded) and skip the ones with no visible bounding box.
-            const anchors = await page
+            //
+            // `href*=` is SUBSTRING matching: a group id that is a prefix of
+            // another id (e.g. 394… vs 3941…) would otherwise match the other
+            // group's links and snapshot its card. Filter with a hard
+            // boundary after the id.
+            const idBoundary = new RegExp(`/groups/${entry.id}(?:[/?#]|$)`);
+            const anchorEls = await page
               .locator(`a[href*="/groups/${entry.id}"]`)
               .all()
-              .catch(() => [] as any[]);
+              .catch(() => [] as Locator[]);
+            const anchors: Locator[] = [];
+            for (const a of anchorEls.slice(0, 12)) {
+              const href = await a.getAttribute("href").catch(() => null);
+              if (href && idBoundary.test(href)) anchors.push(a);
+            }
 
             // The popup ("Public group · N members" / "مجموعة عامة · N عضو")
             // lazy-loads after a short delay, so poll instead of reading once.
             // Ground truth from a DOM probe: its content lives in plain
             // <span>s and its root is NOT role=tooltip/dialog/hovercard, so we
-            // scan any element and keep the minimal containers whose text
-            // actually carries group info — never the whole <body>.
-            let tip = "";
+            // scan any element — but only the freshly-mounted ones (see
+            // tagExistingTipContainers/readFreshTip above), never the whole
+            // <body>.
+            // Tag everything that already carries group info BEFORE hovering;
+            // the popup poll then only accepts text from nodes that mounted
+            // after the hover, so a stale popup from a previously hovered
+            // group can never be attributed to this group.
+            await tagExistingTipContainers().catch(() => {});
             for (const a of anchors.slice(0, 4)) {
               if (tip) break;
               const box = await a.boundingBox().catch(() => null);
               if (!box || box.width < 8 || box.height < 8) continue; // hidden
               try {
                 await a.scrollIntoViewIfNeeded({ timeout: 1000 }).catch(() => {});
-                for (let tries = 0; tries < 10 && !tip; tries++) {
+                let lastTip = "";
+                for (let tries = 0; tries < 10; tries++) {
                   if (tries === 0) await a.hover({ timeout: 1500 });
                   else await page.waitForTimeout(300);
-                  tip = await page
-                    .evaluate(() => {
-                      const norm = (t: string | null) =>
-                        (t || "")
-                          .replace(/[\u200e\u200f]/g, "")
-                          .replace(/\s+/g, " ")
-                          .trim();
-                      const win =
-                        /مجموعة (?:عامة|خاصة)|public group|private group|members|أعضاء|عضو/i;
-                      const out: string[] = [];
-                      for (const el of document.querySelectorAll(
-                        "div,span,section,article,aside,li"
-                      )) {
-                        const t = norm(el.textContent);
-                        if (!t || !win.test(t)) continue;
-                        let childHas = false;
-                        for (const c of el.children) {
-                          if (win.test(norm(c.textContent))) {
-                            childHas = true;
-                            break;
-                          }
-                        }
-                        if (childHas) continue;
-                        out.push(t);
-                        if (out.length >= 3) break;
-                      }
-                      return out.join(" | ");
-                    })
-                    .catch(() => "");
+                  const fresh = await readFreshTip().catch(() => "");
+                  if (fresh) lastTip = fresh;
+                  if (MEMBER_RE.test(fresh)) break; // count arrived
                 }
+                tip = lastTip;
               } catch {
                 // Try the next anchor.
               }
             }
-            if (tip) entry.joinedText += " " + tip;
+            // Only trust the capture when it carries the privacy label: the
+            // hovercard always shows it, while freshly re-mounted list cards
+            // can also expose a member count and must not be mistaken for
+            // the popup.
+            if (tip && !PRIVACY_RE.test(tip)) tip = "";
           } catch {
             // ignore
           } finally {
@@ -325,16 +401,22 @@ export async function scrapeGroups(
           }
         }
 
+        const enriched: Entry = { ...entry, tip };
         const existing = entriesMap.get(entry.id);
         if (!existing) {
-          entriesMap.set(entry.id, entry);
+          entriesMap.set(entry.id, enriched);
         } else {
           // Prefer the richer variant: a real name beats an empty one.
-          if (!existing.name && entry.name) existing.name = entry.name;
-          if (!existing.logoUrl && entry.logoUrl)
-            existing.logoUrl = entry.logoUrl;
-          if (existing.joinedText.length < entry.joinedText.length)
-            existing.joinedText = entry.joinedText;
+          if (!existing.name && enriched.name) existing.name = enriched.name;
+          if (!existing.logoUrl && enriched.logoUrl)
+            existing.logoUrl = enriched.logoUrl;
+          // Card text is only the fallback source for the member count, so
+          // keep the longest capture. The popup text is kept verbatim —
+          // appending it to the card text used to let whatever count came
+          // first in the joined string win, i.e. a neighbor's count.
+          if (existing.joinedText.length < enriched.joinedText.length)
+            existing.joinedText = enriched.joinedText;
+          if (!existing.tip && enriched.tip) existing.tip = enriched.tip;
         }
       }
 
@@ -378,13 +460,33 @@ export async function scrapeGroups(
       let privacy: Group["privacy"] = "unknown";
       let memberCount = "N/A";
 
-      if (/(private group|مجموعة خاصة)/i.test(entry.joinedText))
-        privacy = "private";
-      else if (/(public group|مجموعة عامة)/i.test(entry.joinedText))
-        privacy = "public";
+      // The popup text is preferred for both markers: it comes exclusively
+      // from the freshly-mounted hovercard of this very card, while the card
+      // text can spill past the card boundary and carry a neighbor's count.
+      const tipText = entry.tip || "";
+      if (/(private group|مجموعة خاصة)/i.test(tipText)) privacy = "private";
+      else if (/(public group|مجموعة عامة)/i.test(tipText)) privacy = "public";
+      if (privacy === "unknown") {
+        if (/(private group|مجموعة خاصة)/i.test(entry.joinedText))
+          privacy = "private";
+        else if (/(public group|مجموعة عامة)/i.test(entry.joinedText))
+          privacy = "public";
+      }
 
-      const memberMatch = entry.joinedText.match(MEMBER_RE);
-      if (memberMatch) memberCount = normalizeCount(memberMatch[1]);
+      const tipMatch = tipText.match(MEMBER_RE);
+      if (tipMatch) {
+        memberCount = normalizeCount(tipMatch[1]);
+      } else {
+        // Card-text fallback: only trust it when every count in the text
+        // agrees. Two different counts means neighbors leaked in through the
+        // card ancestor walk — leave N/A so the detail pass can resolve the
+        // real count from the group page.
+        const all = [
+          ...entry.joinedText.matchAll(MEMBER_RE_G),
+        ].map((m) => normalizeCount(m[1]));
+        const uniq = [...new Set(all)];
+        if (uniq.length === 1) memberCount = uniq[0];
+      }
 
       groups.push({
         id: entry.id,
@@ -430,8 +532,8 @@ export async function scrapeGroups(
         if (!group.name) {
           const title = await p.title().catch(() => "");
           const cleaned = title
-            .replace(/[\\u200e\\u200f]/g, "")
-            .replace(/\\s*\\|\\s*Facebook\\s*$/i, "")
+            .replace(/[\u200e\u200f]/g, "")
+            .replace(/\s*\|\s*Facebook\s*$/i, "")
             .trim();
           if (cleaned && cleaned.length >= 2 && cleaned.length <= 140) {
             group.name = cleaned;
@@ -440,9 +542,36 @@ export async function scrapeGroups(
 
         const bodyText = await p
           .evaluate(() =>
-            (document.body?.textContent || "").replace(/[\\u200e\\u200f]/g, "")
+            (document.body?.textContent || "").replace(/[\u200e\u200f]/g, "")
           )
           .catch(() => "");
+
+        if (group.memberCount === "N/A") {
+          // Scoped to this group's own members link — on the group page it is
+          // <a href="/groups/<id>/members/">٢٨٫٥ ألف عضو</a> — instead of the
+          // leftmost "… عضو" anywhere in <body>, which a suggested-groups
+          // module could satisfy with some other group's count.
+          const fromAnchor = await p
+            .evaluate((gid: string) => {
+              const norm = (t: string | null) =>
+                (t || "")
+                  .replace(/[\u200e\u200f]/g, "")
+                  .replace(/\s+/g, " ")
+                  .trim();
+              const memberRe =
+                /([٠-٩\d.,٫]*[٠-٩\d][٠-٩\d.,٫]*(?:\s*[KkMmأ])?(?:\s*(?:(?:أ|آ|ا)?ل(?:ا)?ف(?:ات)?|مليون))?)\s*(?:members?|أعضاء|عضو)/i;
+              const idRe = new RegExp(`/groups/${gid}(?:[/?#]|$)`);
+              for (const a of document.querySelectorAll("a")) {
+                const href = a.getAttribute("href") || "";
+                if (!idRe.test(href)) continue;
+                const m = norm(a.textContent).match(memberRe);
+                if (m) return m[1];
+              }
+              return "";
+            }, group.id)
+            .catch(() => "");
+          if (fromAnchor) group.memberCount = normalizeCount(fromAnchor);
+        }
 
         if (group.memberCount === "N/A" && bodyText) {
           const match = bodyText.match(MEMBER_RE);
@@ -511,8 +640,6 @@ export async function scrapeGroups(
     // skip original sequential block below by returning early via flag
     // (fall through to final filter)
     // We handle final filtering after this block.
-    // Mark by setting a flag variable
-    var detailDone = true; void detailDone;
 
     }
     // Drop anything we couldn't identify (no name after both passes).
